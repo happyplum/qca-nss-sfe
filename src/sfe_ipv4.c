@@ -3,7 +3,7 @@
  *	Shortcut forwarding engine - IPv4 edition.
  *
  * Copyright (c) 2013-2016, 2019-2020, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -36,9 +36,6 @@
 #include <net/protocol.h>
 #include <net/gre.h>
 
-#if defined(SFE_RFS_SUPPORTED)
-#include <ppe_rfs.h>
-#endif
 #include "sfe_debug.h"
 #include "sfe_api.h"
 #include "sfe.h"
@@ -47,14 +44,9 @@
 #include "sfe_ipv4_udp.h"
 #include "sfe_ipv4_tcp.h"
 #include "sfe_ipv4_icmp.h"
-#include "sfe_ipv4_multicast.h"
 #include "sfe_pppoe.h"
-#include "sfe_pppoe_mgr.h"
-#include "sfe_ipv4_pppoe_br.h"
 #include "sfe_ipv4_gre.h"
 #include "sfe_ipv4_tun6rd.h"
-#include "sfe_ipv4_esp.h"
-#include "sfe_ipv4_l2tpv3.h"
 
 static char *sfe_ipv4_exception_events_string[SFE_IPV4_EXCEPTION_EVENT_LAST] = {
 	"UDP_HEADER_INCOMPLETE",
@@ -95,29 +87,19 @@ static char *sfe_ipv4_exception_events_string[SFE_IPV4_EXCEPTION_EVENT_LAST] = {
 	"IP_OPTIONS_INCOMPLETE",
 	"UNHANDLED_PROTOCOL",
 	"NO_HEADROOM",
-	"UNCLONE_FAILED",
 	"INVALID_PPPOE_SESSION",
 	"INCORRECT_PPPOE_PARSING",
 	"PPPOE_NOT_SET_IN_CME",
-	"PPPOE_BR_NOT_IN_CME",
 	"INGRESS_VLAN_TAG_MISMATCH",
 	"INVALID_SOURCE_INTERFACE",
 	"TUN6RD_NO_CONNECTION",
 	"TUN6RD_NEEDS_FRAGMENTATION",
 	"TUN6RD_SYNC_ON_FIND",
-	"TUN6RD_SMALL_TTL",
 	"GRE_HEADER_INCOMPLETE",
 	"GRE_NO_CONNECTION",
 	"GRE_IP_OPTIONS_OR_INITIAL_FRAGMENT",
 	"GRE_SMALL_TTL",
-	"GRE_NEEDS_FRAGMENTATION",
-	"ESP_NO_CONNECTION",
-	"ESP_IP_OPTIONS_OR_INITIAL_FRAGMENT",
-	"ESP_NEEDS_FRAGMENTATION",
-	"ESP_SMALL_TTL",
-	"INGRESS_TRUSTSEC_SGT_MISMATCH",
-	"GSO_NOT_SUPPORTED",
-	"TSO_SEG_MAX_NOT_SUPPORTED"
+	"GRE_NEEDS_FRAGMENTATION"
 };
 
 static struct sfe_ipv4 __si;
@@ -185,10 +167,10 @@ sfe_ipv4_find_connection_match_rcu(struct sfe_ipv4 *si, struct net_device *dev, 
 	lhead = &si->hlist_conn_match_hash_head[conn_match_idx];
 
 	hlist_for_each_entry_rcu(cm, lhead, hnode) {
-		if (cm->match_src_ip != src_ip
-			   || cm->match_dest_ip != dest_ip
-			   || cm->match_src_port != src_port
+		if (cm->match_src_port != src_port
 			   || cm->match_dest_port != dest_port
+			   || cm->match_src_ip != src_ip
+			   || cm->match_dest_ip != dest_ip
 			   || cm->match_protocol != protocol) {
 			continue;
 		}
@@ -199,57 +181,6 @@ sfe_ipv4_find_connection_match_rcu(struct sfe_ipv4 *si, struct net_device *dev, 
 	}
 
 	return cm;
-}
-
-/*
- * sfe_ipv4_connection_mc_dest_compute_translations()
- *	Compute port and address translations for a connection match entry.
- */
-static void sfe_ipv4_connection_mc_dest_compute_translations(struct sfe_ipv4_connection_match *cm, struct sfe_ipv4_mc_dest *dest)
-{
-	/*
-	 * Before we insert the entry look to see if this is tagged as doing address
-	 * translations.  If it is then work out the adjustment that we need to apply
-	 * to the transport checksum.
-	 */
-	if (dest->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_XLATE_SRC) {
-		/*
-		 * Precompute an incremental checksum adjustment so we can
-		 * edit packets in this stream very quickly.  The algorithm is from RFC1624.
-		 */
-		u16 src_ip_hi = cm->match_src_ip >> 16;
-		u16 src_ip_lo = cm->match_src_ip & 0xffff;
-		u32 xlate_src_ip = ~dest->xlate_src_ip;
-		u16 xlate_src_ip_hi = xlate_src_ip >> 16;
-		u16 xlate_src_ip_lo = xlate_src_ip & 0xffff;
-		u16 xlate_src_port = ~dest->xlate_src_ident;
-		u32 adj;
-
-		/*
-		 * When we compute this fold it down to a 16-bit offset
-		 * as that way we can avoid having to do a double
-		 * folding of the twos-complement result because the
-		 * addition of 2 16-bit values cannot cause a double
-		 * wrap-around!
-		 */
-		adj = src_ip_hi + src_ip_lo + cm->match_src_port
-		      + xlate_src_ip_hi + xlate_src_ip_lo + xlate_src_port;
-		adj = (adj & 0xffff) + (adj >> 16);
-		adj = (adj & 0xffff) + (adj >> 16);
-		dest->xlate_src_csum_adjustment = (u16)adj;
-
-	}
-
-	if (dest->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_XLATE_SRC) {
-		u32 adj = ~cm->match_src_ip + dest->xlate_src_ip;
-		if (adj < dest->xlate_src_ip) {
-			adj++;
-		}
-
-		adj = (adj & 0xffff) + (adj >> 16);
-		adj = (adj & 0xffff) + (adj >> 16);
-		dest->xlate_src_partial_csum_adjustment = (u16)adj;
-	}
 }
 
 /*
@@ -390,14 +321,10 @@ static void sfe_ipv4_update_summary_stats(struct sfe_ipv4 *si,  struct sfe_ipv4_
 		stats->packets_dropped64 += s->packets_dropped64;
 		stats->packets_forwarded64 += s->packets_forwarded64;
 		stats->packets_fast_xmited64 += s->packets_fast_xmited64;
-		stats->packets_fast_qdisc_xmited64 += s->packets_fast_qdisc_xmited64;
 		stats->packets_not_forwarded64 += s->packets_not_forwarded64;
 		stats->pppoe_encap_packets_forwarded64 += s->pppoe_encap_packets_forwarded64;
 		stats->pppoe_decap_packets_forwarded64 += s->pppoe_decap_packets_forwarded64;
 		stats->pppoe_bridge_packets_forwarded64 += s->pppoe_bridge_packets_forwarded64;
-		stats->pppoe_bridge_packets_3tuple_forwarded64 += s->pppoe_bridge_packets_3tuple_forwarded64;
-		stats->connection_create_requests_overflow64 += s->connection_create_requests_overflow64;
-		stats->bridge_vlan_passthorugh_forwarded64 += s->bridge_vlan_passthorugh_forwarded64;
 	}
 
 }
@@ -498,7 +425,7 @@ static inline void sfe_ipv4_remove_connection_match(struct sfe_ipv4 *si, struct 
 static inline unsigned int sfe_ipv4_get_connection_hash(u8 protocol, __be32 src_ip, __be16 src_port,
 							__be32 dest_ip, __be16 dest_port)
 {
-	u32 hash = ntohl(src_ip ^ dest_ip) ^ protocol ^ ntohs(src_port) ^ dest_port;
+	u32 hash = ntohl(src_ip ^ dest_ip) ^ protocol ^ ntohs(src_port ^ dest_port);
 	return ((hash >> SFE_IPV4_CONNECTION_HASH_SHIFT) ^ hash) & SFE_IPV4_CONNECTION_HASH_MASK;
 }
 
@@ -586,9 +513,7 @@ static void sfe_ipv4_insert_connection(struct sfe_ipv4 *si, struct sfe_ipv4_conn
 	 * Insert the connection match objects too.
 	 */
 	sfe_ipv4_insert_connection_match(si, c->original_match);
-	if (c->reply_match) {
-		sfe_ipv4_insert_connection_match(si, c->reply_match);
-	}
+	sfe_ipv4_insert_connection_match(si, c->reply_match);
 }
 
 /*
@@ -604,34 +529,17 @@ bool sfe_ipv4_remove_connection(struct sfe_ipv4 *si, struct sfe_ipv4_connection 
 		return false;
 	}
 
-	if (c->reply_match) {
-		/*
-		 * dereference the decap direction top_interface_dev
-		 */
-		if (c->reply_match->top_interface_dev) {
-			dev_put(c->reply_match->top_interface_dev);
-		}
-
-		/*
-		 * If qdisc_xmit_dev is present, dereference qdisc net dev.
-		 */
-		if (c->reply_match->qdisc_xmit_dev) {
-			dev_put(c->reply_match->xmit_dev);
-		}
-
-		/*
-		 * Remove the connection match objects.
-		 */
-		sfe_ipv4_remove_connection_match(si, c->reply_match);
+	/*
+	 * dereference the decap direction top_interface_dev
+	 */
+	if (c->reply_match->top_interface_dev) {
+		dev_put(c->reply_match->top_interface_dev);
 	}
 
 	/*
-	 * If qdisc_xmit_dev is present, dereference qdisc net dev.
+	 * Remove the connection match objects.
 	 */
-	if (c->original_match->qdisc_xmit_dev) {
-		dev_put(c->original_match->xmit_dev);
-	}
-
+	sfe_ipv4_remove_connection_match(si, c->reply_match);
 	sfe_ipv4_remove_connection_match(si, c->original_match);
 
 	/*
@@ -711,26 +619,25 @@ static void sfe_ipv4_gen_sync_connection(struct sfe_ipv4 *si, struct sfe_ipv4_co
 	sis->src_td_max_window = original_cm->protocol_state.tcp.max_win;
 	sis->src_td_end = original_cm->protocol_state.tcp.end;
 	sis->src_td_max_end = original_cm->protocol_state.tcp.max_end;
+	sis->dest_td_max_window = reply_cm->protocol_state.tcp.max_win;
+	sis->dest_td_end = reply_cm->protocol_state.tcp.end;
+	sis->dest_td_max_end = reply_cm->protocol_state.tcp.max_end;
 
 	sfe_ipv4_connection_match_update_summary_stats(original_cm, &packet_count, &byte_count);
 	sis->src_new_packet_count = packet_count;
 	sis->src_new_byte_count = byte_count;
+
+	sfe_ipv4_connection_match_update_summary_stats(reply_cm, &packet_count, &byte_count);
+	sis->dest_new_packet_count = packet_count;
+	sis->dest_new_byte_count = byte_count;
+
 	sis->src_dev = original_cm->match_dev;
 	sis->src_packet_count = original_cm->rx_packet_count64;
 	sis->src_byte_count = original_cm->rx_byte_count64;
 
-	if (reply_cm) {
-		sis->dest_td_max_window = reply_cm->protocol_state.tcp.max_win;
-		sis->dest_td_end = reply_cm->protocol_state.tcp.end;
-		sis->dest_td_max_end = reply_cm->protocol_state.tcp.max_end;
-
-		sfe_ipv4_connection_match_update_summary_stats(reply_cm, &packet_count, &byte_count);
-		sis->dest_new_packet_count = packet_count;
-		sis->dest_new_byte_count = byte_count;
-		sis->dest_dev = reply_cm->match_dev;
-		sis->dest_packet_count = reply_cm->rx_packet_count64;
-		sis->dest_byte_count = reply_cm->rx_byte_count64;
-	}
+	sis->dest_dev = reply_cm->match_dev;
+	sis->dest_packet_count = reply_cm->rx_packet_count64;
+	sis->dest_byte_count = reply_cm->rx_byte_count64;
 
 	sis->reason = reason;
 
@@ -742,19 +649,6 @@ static void sfe_ipv4_gen_sync_connection(struct sfe_ipv4 *si, struct sfe_ipv4_co
 }
 
 /*
- * sfe_ipv4_free_mc_dest_rcu
- *	Delay to free the multicast dest.
- */
-static void sfe_ipv4_free_mc_dest_rcu(struct rcu_head *head)
-{
-	struct sfe_ipv4_mc_dest *mc_dest;
-	mc_dest = container_of(head, struct sfe_ipv4_mc_dest, rcu);
-	dev_put(mc_dest->xmit_dev);
-	kfree(mc_dest);
-	return;
-}
-
-/*
  * sfe_ipv4_free_connection_rcu()
  *	Called at RCU qs state to free the connection object.
  */
@@ -763,7 +657,6 @@ static void sfe_ipv4_free_connection_rcu(struct rcu_head *head)
 	struct sfe_ipv4_connection *c;
 	struct udp_sock *up;
 	struct sock *sk;
-	sfe_fls_conn_delete_t delete_cb;
 
 	/*
 	 * We dont need spin lock as the connection is already removed from link list
@@ -775,33 +668,13 @@ static void sfe_ipv4_free_connection_rcu(struct rcu_head *head)
 	DEBUG_TRACE("%px: connecton has been deleted\n", c);
 
 	/*
-	 * Delete flow statistics information.
-	 */
-	rcu_read_lock();
-	delete_cb = rcu_dereference(sfe_fls_info.delete_cb);
-	if (c->original_match->fls_conn && delete_cb) {
-		delete_cb(c->original_match->fls_conn);
-		c->original_match->fls_conn = NULL;
-	}
-
-	if (c->reply_match && c->reply_match->fls_conn && delete_cb) {
-		delete_cb(c->reply_match->fls_conn);
-		c->reply_match->fls_conn = NULL;
-	}
-	rcu_read_unlock();
-
-	/*
 	 * Decrease the refcount taken in function sfe_ipv4_create_rule(),
 	 * during call of __udp4_lib_lookup()
 	 */
-	if (c->reply_match) {
-		up = c->reply_match->up;
-		if (up) {
-			sk = (struct sock *)up;
-			sock_put(sk);
-		}
-		dev_put(c->reply_dev);
-		kfree(c->reply_match);
+	up = c->reply_match->up;
+	if (up) {
+		sk = (struct sock *)up;
+		sock_put(sk);
 	}
 
 	/*
@@ -809,48 +682,10 @@ static void sfe_ipv4_free_connection_rcu(struct rcu_head *head)
 	 * for our connection objects.
 	 */
 	dev_put(c->original_dev);
-
-	if (c->original_match->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_MULTICAST) {
-		struct sfe_ipv4_mc_dest *cur, *tmp;
-		list_for_each_entry_safe(cur, tmp, &(c->original_match->mc_list), list) {
-			list_del_rcu(&cur->list);
-			dev_put(cur->xmit_dev);
-
-			/*
-			 * The connection c has been quiescent after being
-			 * removed from connection list. During the grace
-			 * period, mc_create_msg and the forwarding datapath
-			 * could not get access this c any more and therefore
-			 * mc list could not be accessed too. So we could
-			 * replace call_rcu with kfree safely.
-			 */
-			kfree(cur);
-		}
-	}
-
+	dev_put(c->reply_dev);
 	kfree(c->original_match);
+	kfree(c->reply_match);
 	kfree(c);
-}
-
-/*
- * sfe_ipv4_fls_clear()
- *	Clear all flow stats connection pointers.
- */
-void sfe_ipv4_fls_clear(void)
-{
-	struct sfe_ipv4 *si = &__si;
-	uint32_t i;
-	struct sfe_ipv4_connection_match *cm = NULL;
-	rcu_read_lock();
-	for (i = 0; i < SFE_IPV4_CONNECTION_HASH_SIZE; i++) {
-		struct hlist_head *lhead = &si->hlist_conn_match_hash_head[i];
-
-		hlist_for_each_entry_rcu(cm, lhead, hnode) {
-			cm->fls_conn = NULL;
-		}
-		break;
-	}
-	rcu_read_unlock();
 }
 
 /*
@@ -865,7 +700,7 @@ void sfe_ipv4_sync_status(struct sfe_ipv4 *si,
 					       struct sfe_ipv4_connection *c,
 					       sfe_sync_reason_t reason)
 {
-	struct sfe_connection_sync sis = {/*zero*/};
+	struct sfe_connection_sync sis;
 	u64 now_jiffies;
 	sfe_sync_rule_callback_t sync_rule_callback;
 
@@ -901,25 +736,6 @@ void sfe_ipv4_flush_connection(struct sfe_ipv4 *si,
 
 	this_cpu_inc(si->stats_pcpu->connection_flushes64);
 	sfe_ipv4_sync_status(si, c, reason);
-
-#if defined(SFE_RFS_SUPPORTED)
-	if (sfe_is_ppe_rfs_feature_enabled()) {
-		struct ppe_rfs_ipv4_rule_destroy_msg pr4rd;
-
-		pr4rd.original_dev = c->original_dev;
-		pr4rd.reply_dev = c->reply_dev;
-
-		pr4rd.tuple.flow_ip = ntohl(c->src_ip);
-		pr4rd.tuple.flow_ident = ntohs(c->src_port);
-		pr4rd.tuple.return_ip = ntohl(c->dest_ip);
-		pr4rd.tuple.return_ident = ntohs(c->dest_port);
-		pr4rd.tuple.protocol = c->protocol;
-
-		if (ppe_rfs_ipv4_rule_destroy(&pr4rd) != PPE_RFS_RET_SUCCESS) {
-			DEBUG_INFO("%p: Error in deleting ppe rules\n", &pr4rd);
-		}
-	}
-#endif
 
 	/*
 	 * Release our hold of the source and dest devices and free the memory
@@ -1052,17 +868,6 @@ int sfe_ipv4_recv(struct net_device *dev, struct sk_buff *skb, struct sfe_l2_inf
 	}
 
 	/*
-	 * Remove any data link layer's padding for non paged buffers, for paged buffers
-	 * the ethernet frame would usually not have any padding.
-	 * Usually TCP ACK's(with length 18(eth)+20(IP)+20(TCP) < 64) have ethernet padding set.
-	 */
-	if (likely(!skb->data_len)) {
-		skb->len = tot_len;
-		skb_set_tail_pointer(skb, tot_len);
-		len = tot_len;
-	}
-
-	/*
 	 * If we have a (first) fragment then mark it to cause any connection to flush.
 	 */
 	sync_on_find = unlikely(frag_off & IP_MF) ? true : false;
@@ -1084,17 +889,6 @@ int sfe_ipv4_recv(struct net_device *dev, struct sk_buff *skb, struct sfe_l2_inf
 		sync_on_find = true;
 	}
 
-	/*
-	 * Handle PPPoE bridge packets using 3-tuple acceleration if SFE_PPPOE_BR_ACCEL_MODE_EN_3T
-	 */
-	if (unlikely(sfe_l2_parse_flag_check(l2_info, SFE_L2_PARSE_FLAGS_PPPOE_INGRESS)) &&
-	    unlikely(sfe_pppoe_get_br_accel_mode() == SFE_PPPOE_BR_ACCEL_MODE_EN_3T)) {
-		struct ethhdr *eth = eth_hdr(skb);
-		if (!sfe_pppoe_mgr_find_session(l2_info->pppoe_session_id, eth->h_source)) {
-			return sfe_ipv4_recv_pppoe_bridge(si, skb, dev, len, iph, ihl, l2_info);
-		}
-	}
-
 	protocol = iph->protocol;
 	if (IPPROTO_UDP == protocol) {
 		return sfe_ipv4_recv_udp(si, skb, dev, len, iph, ihl, sync_on_find, l2_info, tun_outer);
@@ -1102,10 +896,6 @@ int sfe_ipv4_recv(struct net_device *dev, struct sk_buff *skb, struct sfe_l2_inf
 
 	if (IPPROTO_TCP == protocol) {
 		return sfe_ipv4_recv_tcp(si, skb, dev, len, iph, ihl, sync_on_find, l2_info);
-	}
-
-	if (IPPROTO_ESP == protocol) {
-		return sfe_ipv4_recv_esp(si, skb, dev, len, iph, ihl, sync_on_find, l2_info, tun_outer);
 	}
 
 	if (IPPROTO_ICMP == protocol) {
@@ -1120,11 +910,6 @@ int sfe_ipv4_recv(struct net_device *dev, struct sk_buff *skb, struct sfe_l2_inf
 	if (IPPROTO_IPV6 == protocol) {
 		return sfe_ipv4_recv_tun6rd(si, skb, dev, len, iph, ihl, sync_on_find, l2_info, true);
 	}
-#ifdef SFE_L2TPV3_ENABLED
-	if (IPPROTO_L2TP == protocol) {
-		return sfe_ipv4_recv_l2tpv3(si, skb, dev, len, iph, ihl, sync_on_find, l2_info, tun_outer);
-	}
-#endif
 
 	sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_UNHANDLED_PROTOCOL);
 
@@ -1190,76 +975,56 @@ sfe_ipv4_update_protocol_state(struct sfe_ipv4_connection *c,
 }
 
 /*
- * sfe_ipv4_match_entry_set_vlan_hdr()
- * 	We may choose to stack VLAN headers(in case of traditional & Bridge VLAN Filter tags).
- * 	In case, we want to avoid stacking then caller needs to ensure to set
- * 	vlan_hdr_cnt to 0 & clear the vlan_hdr array accordingly.
- */
-static bool sfe_ipv4_match_entry_set_vlan_hdr(u8 *vlan_hdr_cnt, struct sfe_vlan_hdr *vlan_hdr,
-		u32 primary_vlan_tag, u32 secondary_vlan_tag) {
-	u16 tpid;
-
-	u8 idx = (*vlan_hdr_cnt);
-	if ((primary_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
-		if (idx == SFE_MAX_VLAN_DEPTH) {
-			DEBUG_TRACE("%px: vlan_hdr_cnt overflow while filling vlan_tag=%d\n", vlan_hdr, (u16)primary_vlan_tag);
-			return false;
-		}
-
-		tpid = (u16)(primary_vlan_tag >> 16);
-		vlan_hdr[idx].tpid = ntohs(tpid);
-		vlan_hdr[idx].tci = (u16)primary_vlan_tag;
-		(*vlan_hdr_cnt)++;
-	}
-
-	idx = (*vlan_hdr_cnt);
-	if ((secondary_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
-		if (idx == SFE_MAX_VLAN_DEPTH) {
-			DEBUG_TRACE("%px: vlan_hdr_cnt overflow while filling vlan_tag=%d\n", vlan_hdr, (u16)secondary_vlan_tag);
-			return false;
-		}
-
-		tpid = (u16)(secondary_vlan_tag >> 16);
-		vlan_hdr[idx].tpid = ntohs(tpid);
-		vlan_hdr[idx].tci = (u16)secondary_vlan_tag;
-		(*vlan_hdr_cnt)++;
-	}
-
-	return true;
-}
-
-/*
  * sfe_ipv4_match_entry_set_vlan()
  */
-static bool sfe_ipv4_match_entry_set_vlan(
+static void sfe_ipv4_match_entry_set_vlan(
 			struct sfe_ipv4_connection_match *cm,
 			u32 primary_ingress_vlan_tag,
 			u32 primary_egress_vlan_tag,
 			u32 secondary_ingress_vlan_tag,
 			u32 secondary_egress_vlan_tag)
 {
-	if (sfe_ipv4_match_entry_set_vlan_hdr(&(cm->ingress_vlan_hdr_cnt), cm->ingress_vlan_hdr,
-			primary_ingress_vlan_tag, secondary_ingress_vlan_tag)) {
-		if (sfe_ipv4_match_entry_set_vlan_hdr(&(cm->egress_vlan_hdr_cnt), cm->egress_vlan_hdr,
-				primary_egress_vlan_tag, secondary_egress_vlan_tag)) {
-			return true;
-		}
+	u16 tpid;
+	/*
+	 * Prevent stacking header counts when updating.
+	 */
+	cm->ingress_vlan_hdr_cnt = 0;
+	cm->egress_vlan_hdr_cnt = 0;
+	memset(cm->ingress_vlan_hdr, 0, sizeof(cm->ingress_vlan_hdr));
+	memset(cm->egress_vlan_hdr, 0, sizeof(cm->egress_vlan_hdr));
+
+	/*
+	 * vlan_hdr[0] corresponds to outer tag
+	 * vlan_hdr[1] corresponds to inner tag
+	 * Extract the vlan information (tpid and tci) from rule message
+	 */
+	if ((primary_ingress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
+		tpid = (u16)(primary_ingress_vlan_tag >> 16);
+		cm->ingress_vlan_hdr[0].tpid = ntohs(tpid);
+		cm->ingress_vlan_hdr[0].tci = (u16)primary_ingress_vlan_tag;
+		cm->ingress_vlan_hdr_cnt++;
 	}
 
-	return false;
-}
+	if ((secondary_ingress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
+		tpid = (u16)(secondary_ingress_vlan_tag >> 16);
+		cm->ingress_vlan_hdr[1].tpid = ntohs(tpid);
+		cm->ingress_vlan_hdr[1].tci = (u16)secondary_ingress_vlan_tag;
+		cm->ingress_vlan_hdr_cnt++;
+	}
 
-/*
- * sfe_ipv4_match_entry_set_trustsec()
- */
-static void sfe_ipv4_match_entry_set_trustsec(
-			struct sfe_ipv4_connection_match *cm,
-			u16 ingress_sgt,
-			u16 egress_sgt
-			)
-{
-	cm->ingress_trustsec_hdr.sgt = ingress_sgt;
-	cm->egress_trustsec_hdr.sgt = egress_sgt;
+	if ((primary_egress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
+		tpid = (u16)(primary_egress_vlan_tag >> 16);
+		cm->egress_vlan_hdr[0].tpid = ntohs(tpid);
+		cm->egress_vlan_hdr[0].tci = (u16)primary_egress_vlan_tag;
+		cm->egress_vlan_hdr_cnt++;
+	}
+
+	if ((secondary_egress_vlan_tag & VLAN_VID_MASK) != SFE_VLAN_ID_NOT_CONFIGURED) {
+		tpid = (u16)(secondary_egress_vlan_tag >> 16);
+		cm->egress_vlan_hdr[1].tpid = ntohs(tpid);
+		cm->egress_vlan_hdr[1].tci = (u16)secondary_egress_vlan_tag;
+		cm->egress_vlan_hdr_cnt++;
+	}
 }
 
 void sfe_ipv4_update_rule(struct sfe_ipv4_rule_create_msg *msg)
@@ -1302,43 +1067,10 @@ void sfe_ipv4_mark_rule_update(struct sfe_connection_mark *mark)
 		DEBUG_WARN("%px: connection not found for mark update\n", mark);
 		return;
 	}
-
-	switch (mark->type) {
-	case SFE_CONNECTION_MARK_TYPE_CONNMARK:
-		c->original_match->mark = mark->flow_mark;
-		if (c->reply_match) {
-			c->reply_match->mark = mark->return_mark;
-		}
-		spin_unlock_bh(&si->lock);
-		break;
-
-	case SFE_CONNECTION_MARK_TYPE_SAWFMARK:
-		if (mark->flags & SFE_SAWF_MARK_FLOW_VALID) {
-			c->original_match->mark = mark->flow_mark;
-			c->original_match->svc_id = mark->flow_svc_id;
-			c->original_match->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
-			c->original_match->sawf_valid = true;
-		}
-
-		if (c->reply_match) {
-			if (mark->flags & SFE_SAWF_MARK_RETURN_VALID) {
-				c->reply_match->mark = mark->return_mark;
-				c->reply_match->svc_id = mark->return_svc_id;
-				c->reply_match->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
-				c->reply_match->sawf_valid = true;
-			}
-		}
-		spin_unlock_bh(&si->lock);
-		break;
-
-	default:
-		spin_unlock_bh(&si->lock);
-		DEBUG_WARN("%px: unsupported mark type: %d\n", mark, mark->type);
-		break;
-	}
-
-	DEBUG_TRACE("%px: flow/return mark updated with %x/%x\n",
-			c, mark->flow_mark, mark->return_mark);
+	c->original_match->mark = mark->mark;
+	c->reply_match->mark = mark->mark;
+	spin_unlock_bh(&si->lock);
+	DEBUG_TRACE("%px: connection mark updated with %d\n", mark, mark->mark);
 }
 EXPORT_SYMBOL(sfe_ipv4_mark_rule_update);
 
@@ -1406,625 +1138,6 @@ bool sfe_ipv4_service_class_stats_get(uint8_t sid, uint64_t *bytes, uint64_t *pa
 }
 
 /*
- * sfe_ipv4_add_mc_dest_tail()
- *	Add mc dest to the tail.
- * return 0 successful, return 1 failed.
- */
-int sfe_ipv4_add_mc_dest_tail(struct sfe_ipv4_connection_match *cm, struct sfe_ipv4_mc_dest *mc_dest)
-{
-	struct sfe_ipv4_mc_dest *cur;
-
-	list_for_each_entry_rcu(cur, &(cm->mc_list), list) {
-		if (cur->xmit_dev == mc_dest->xmit_dev) {
-			DEBUG_WARN("%px: The tail new destination[%s] already exists in the list\n", cm, mc_dest->xmit_dev->name);
-			return 1;
-		}
-	}
-	list_add_tail_rcu(&(mc_dest->list), &(cm->mc_list));
-	return 0;
-}
-
-/*
- * sfe_ipv4_add_mc_dest_head()
- *	Add mc dest to the head.
- * return 0 successful, return 1 failed.
- */
-int sfe_ipv4_add_mc_dest_head(struct sfe_ipv4_connection_match *cm, struct sfe_ipv4_mc_dest *mc_dest)
-{
-	struct sfe_ipv4_mc_dest *cur;
-	list_for_each_entry_rcu(cur, &(cm->mc_list), list) {
-		if (cur->xmit_dev == mc_dest->xmit_dev) {
-			DEBUG_WARN("%px: The head new destination[%s] already exists in the list\n", cm, mc_dest->xmit_dev->name);
-			return 1;
-		}
-	}
-	list_add_rcu(&(mc_dest->list), &(cm->mc_list));
-
-	return 0;
-}
-
-/*
- * sfe_ipv4_find_and_delete_mc_dest()
- *	Delete the mc dest entry in the list.
- * return 0 successful, return 1 failed.
- */
-int sfe_ipv4_find_and_delete_mc_dest(struct sfe_ipv4_connection_match *cm, struct net_device *dest_dev)
-{
-	struct sfe_ipv4_mc_dest *cur, *tmp;
-
-	list_for_each_entry_safe(cur, tmp, &(cm->mc_list), list) {
-		if(cur->xmit_dev == dest_dev) {
-			list_del_rcu(&cur->list);
-			call_rcu(&cur->rcu, sfe_ipv4_free_mc_dest_rcu);
-			return 0;
-		}
-	}
-
-	return 1;
-}
-
-/*
- * sfe_ipv4_allocate_mc_dest()
- *	Allocate a new dest and fill the rule information.
- */
-struct sfe_ipv4_mc_dest *sfe_ipv4_allocate_mc_dest(struct sfe_ipv4_connection_match *cm, struct sfe_ipv4_mc_rule_create_msg *msg,
-		struct sfe_ipv4_mc_device_entry *if_rule, struct net_device *dest_dev)
-{
-	struct sfe_ipv4_mc_dest *dest;
-	int skb_changed = 0;
-
-	dest = (struct sfe_ipv4_mc_dest *)kzalloc(sizeof(struct sfe_ipv4_mc_dest), GFP_ATOMIC);
-	if (!dest) {
-		return NULL;
-	}
-
-	if (if_rule->rule_flags & SFE_RULE_CREATE_FLAG_FLOW_TRANSMIT_FAST) {
-		DEBUG_TRACE("%px: Fast transmit set to device:%s\n", msg, dest_dev->name);
-		dest->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_FAST_XMIT_DEV_ADMISSION;
-	}
-
-	if (if_rule->valid_flags & SFE_MC_RULE_CREATE_IF_FLAG_VLAN_VALID) {
-		/*
-		 * Initialize egress VLAN information.
-		 */
-		dest->egress_vlan_hdr_cnt = 0;
-		memset(dest->egress_vlan_hdr, 0, sizeof(struct sfe_vlan_hdr) * SFE_MAX_VLAN_DEPTH);
-
-		sfe_ipv4_match_entry_set_vlan_hdr(&(dest->egress_vlan_hdr_cnt), dest->egress_vlan_hdr,
-				if_rule->egress_vlan_tag[0],if_rule->egress_vlan_tag[1]);
-		DEBUG_TRACE("%px: %d Vlan was set to %s\n", msg, (u32)dest->egress_vlan_hdr_cnt, dest_dev->name);
-
-		if ((if_rule->rule_flags & SFE_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE) &&
-				dest->egress_vlan_hdr_cnt > 0) {
-			DEBUG_TRACE("%px: %d Vlan will be inserted to %s\n", msg, (u32)dest->egress_vlan_hdr_cnt, dest_dev->name);
-			dest->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG;
-			dest->l2_hdr_size += dest->egress_vlan_hdr_cnt * VLAN_HLEN;
-			skb_changed = 1;
-		}
-	}
-
-	if (if_rule->valid_flags & SFE_RULE_CREATE_PPPOE_ENCAP_VALID) {
-		DEBUG_TRACE("%px: PPPoE header was set to %s session id: %d remote mac:%pM\n", msg, dest_dev->name,
-				if_rule->pppoe_session_id, if_rule->pppoe_remote_mac);
-		dest->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP;
-		dest->l2_hdr_size += PPPOE_SES_HLEN;
-		dest->pppoe_session_id = if_rule->pppoe_session_id;
-		ether_addr_copy(dest->pppoe_remote_mac, if_rule->pppoe_remote_mac);
-		skb_changed = 1;
-	}
-
-	if (if_rule->rule_flags & SFE_MC_RULE_CREATE_IF_FLAG_BRIDGE_FLOW) {
-		dest->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_FLOW;
-	}
-
-	/*
-	 * For the non-arp interface, we don't write L2 HDR.
-	 */
-	if (sfe_ipv4_xmit_eth_type_check(dest_dev, if_rule->rule_flags)) {
-		/*
-		 * Check whether the rule has configured a specific source MAC address to use.
-		 * This is needed when virtual L3 interfaces such as br-lan, macvlan, vlan are used during egress
-		 */
-		if (if_rule->rule_flags & SFE_MC_RULE_CREATE_IF_FLAG_BRIDGE_FLOW) {
-			ether_addr_copy((u8 *)dest->xmit_src_mac, (u8 *)msg->conn_rule.flow_mac);
-		} else {
-			ether_addr_copy((u8 *)dest->xmit_src_mac, (u8 *)if_rule->if_mac);
-		}
-
-		DEBUG_TRACE("%px: L2 HDR was set to device:%s\n", msg, dest_dev->name);
-
-		ether_addr_copy((u8 *)dest->xmit_dest_mac, (u8 *)msg->dest_mac);
-		dest->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_L2_HDR;
-		dest->l2_hdr_size += ETH_HLEN;
-		skb_changed = 1;
-		/*
-		 * If our dev writes Ethernet headers then we can write a really fast
-		 * version.
-		 */
-		if (dest_dev->header_ops) {
-			if (dest_dev->header_ops->create == eth_header) {
-				dest->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_FAST_ETH_HDR;
-			}
-		}
-	}
-
-	/*
-	 * If l2_features are disabled and flow uses l2 features such as macvlan/bridge/pppoe/vlan,
-	 * bottom interfaces are expected to be disabled in the flow rule and always top interfaces
-	 * are used. In such cases, do not use HW csum offload. csum offload is used only when we
-	 * are sending directly to the destination interface that supports it.
-	 */
-	if (likely(dest_dev->features & NETIF_F_HW_CSUM) && sfe_dev_has_hw_csum(dest_dev)) {
-		if ((msg->conn_rule.return_top_interface_num == msg->conn_rule.return_interface_num) ||
-				(if_rule->rule_flags & SFE_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE)) {
-			/*
-			 * Enable CSUM offload
-			 */
-			dest->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD;
-		}
-	}
-
-	dest->xmit_dev = dest_dev;
-
-	if (if_rule->valid_flags & SFE_MC_RULE_CREATE_IF_FLAG_NAT_VALID) {
-
-		DEBUG_TRACE("%px: SRC nat was applied to:%s\n", msg, dest_dev->name);
-		dest->xlate_src_ip =  if_rule->xlate_src_ip;
-		dest->xlate_src_ident = if_rule->xlate_src_ident;
-		dest->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_XLATE_SRC;
-		sfe_ipv4_connection_mc_dest_compute_translations(cm, dest);
-		skb_changed = 1;
-	}
-
-
-	if (skb_changed) {
-		dest->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MULTICAST_CHANGED;
-	}
-	return dest;
-}
-
-/*
- * sfe_ipv4_update_mc_dest()
- *	update the mc dest rules.
- */
-int sfe_ipv4_update_mc_dest(struct sfe_ipv4_connection_match *cm, struct sfe_ipv4_mc_rule_create_msg *msg)
-{
-	int idx;
-	u16 if_cnt = msg->if_cnt;
-	for (idx = 0; idx < if_cnt; idx++) {
-		struct sfe_ipv4_mc_device_entry *if_rule = &msg->if_rule[idx];
-		struct sfe_ipv4_mc_dest *dest;
-		struct net_device *dest_dev;
-		s32 dest_interface_num;
-
-		dest_interface_num = if_rule->if_num;
-		dest_dev = dev_get_by_index(&init_net, dest_interface_num);
-		if (!dest_dev) {
-			DEBUG_WARN("%px: Unable to find dest_dev corresponding to %d\n", msg, dest_interface_num);
-			return -EINVAL;
-		}
-
-		if (if_rule->rule_flags & SFE_MC_RULE_CREATE_IF_FLAG_LEAVE) {
-			sfe_ipv4_find_and_delete_mc_dest(cm, dest_dev);
-			dev_put(dest_dev);
-			continue;
-		}
-
-		dest = sfe_ipv4_allocate_mc_dest(cm, msg, if_rule, dest_dev);
-		if (!dest) {
-			DEBUG_WARN("%px: Allocate multicast dest of %s failed!\n", msg, dest_dev->name);
-			dev_put(dest_dev);
-			return -EINVAL;
-		}
-
-		/*
-		 * make the destination that need change the skb before the
-		 * destinations that doesn't.
-		 * so the last destination of the list could safely use the
-		 * original skb.
-		 */
-		if (dest->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_MULTICAST_CHANGED) {
-			if (sfe_ipv4_add_mc_dest_head(cm, dest)) {
-				DEBUG_WARN("%px: Unable to insert dest[%s] to the head\n", msg, dest_dev->name);
-				dev_put(dest_dev);
-				kfree(dest);
-				return -EINVAL;
-			}
-		} else {
-			if (sfe_ipv4_add_mc_dest_tail(cm, dest)) {
-				DEBUG_WARN("%px: Unable to insert dest[%s] to the tail\n", msg, dest_dev->name);
-				dev_put(dest_dev);
-				kfree(dest);
-				return -EINVAL;
-			}
-		}
-	}
-	return 0;
-}
-
-/*
- * sfe_ipv4_create_mc_dest()
- *	create the mc dest rules.
- */
-int sfe_ipv4_create_mc_dest(struct sfe_ipv4_connection_match *cm, struct sfe_ipv4_mc_rule_create_msg *msg)
-{
-	int idx;
-	u16 if_cnt = msg->if_cnt;
-	DEBUG_INFO("%px: Create multicast dest list dev cnt:%d\n", msg, if_cnt);
-	for (idx = 0; idx < if_cnt; idx++) {
-		struct sfe_ipv4_mc_device_entry *if_rule = &msg->if_rule[idx];
-		struct sfe_ipv4_mc_dest *dest;
-		struct net_device *dest_dev;
-		s32 dest_interface_num;
-
-		dest_interface_num = if_rule->if_num;
-		dest_dev = dev_get_by_index(&init_net, dest_interface_num);
-		if (!dest_dev) {
-			DEBUG_WARN("%px: Unable to find dest_dev corresponding to %d\n", msg,
-					dest_interface_num);
-			return -EINVAL;
-		}
-
-		dest = sfe_ipv4_allocate_mc_dest(cm, msg, if_rule, dest_dev);
-		if (!dest) {
-			dev_put(dest_dev);
-			DEBUG_WARN("%px: Allocate multicast dest of %s failed!\n", msg, dest_dev->name);
-			return -EINVAL;
-
-		}
-
-		/*
-		 * make the destination that need change the skb before the
-		 * destinations that doesn't.
-		 * so the last destination of the list could safely use the
-		 * original skb.
-		 */
-		if (dest->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_MULTICAST_CHANGED) {
-			if (sfe_ipv4_add_mc_dest_head(cm, dest)) {
-				DEBUG_WARN("%px: Unable to insert dest[%s] to the head\n", msg, dest_dev->name);
-				dev_put(dest_dev);
-				kfree(dest);
-				return -EINVAL;
-			}
-		} else {
-			if (sfe_ipv4_add_mc_dest_tail(cm, dest)) {
-				DEBUG_WARN("%px: Unable to insert dest[%s] to the tail\n", msg, dest_dev->name);
-				dev_put(dest_dev);
-				kfree(dest);
-				return -EINVAL;
-			}
-		}
-	}
-	return 0;
-}
-
-/*
- * sfe_ipv4_create_mc_rule()
- *	Create a multicast forwarding rule.
- */
-int sfe_ipv4_create_mc_rule(struct sfe_ipv4_mc_rule_create_msg *msg)
-{
-	struct sfe_ipv4 *si = &__si;
-	struct sfe_ipv4_connection *c, *c_old;
-	struct sfe_ipv4_connection_match *original_cm;
-	struct net_device *dest_dev;
-	struct net_device *src_dev;
-	struct sfe_ipv4_5tuple *tuple = &msg->tuple;
-	s32 flow_interface_num = msg->conn_rule.flow_top_interface_num;
-	unsigned int src_if_idx;
-	uint32_t if_min_mtu;
-	int idx;
-	u32 flow_sawf_tag;
-
-	if (IPPROTO_UDP != tuple->protocol) {
-		this_cpu_inc(si->stats_pcpu->connection_create_failures64);
-		return -EINVAL;
-	}
-
-	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE) {
-		flow_interface_num = msg->conn_rule.flow_interface_num;
-	}
-
-	src_dev = dev_get_by_index(&init_net, flow_interface_num);
-	if (!src_dev || src_dev->reg_state != NETREG_REGISTERED) {
-		DEBUG_WARN("%px: Unable to find src_dev corresponding to %d\n", msg,
-						flow_interface_num);
-		this_cpu_inc(si->stats_pcpu->connection_create_failures64);
-		return -EINVAL;
-	}
-
-	if_min_mtu = msg->if_rule[0].if_mtu;
-
-	for (idx = 0; idx < msg->if_cnt; idx ++) {
-		s32 dest_interface_num;
-		struct sfe_ipv4_mc_device_entry *if_rule = &msg->if_rule[idx];
-		dest_interface_num = if_rule->if_num;
-		dest_dev = dev_get_by_index(&init_net, dest_interface_num);
-		if (!dest_dev) {
-			DEBUG_WARN("%px: Unable to find dest_dev corresponding to %d\n", msg,
-					dest_interface_num);
-			this_cpu_inc(si->stats_pcpu->connection_create_failures64);
-			dev_put(src_dev);
-			return -EINVAL;
-		}
-
-		if (unlikely(dest_dev->reg_state != NETREG_REGISTERED)) {
-			dev_put(src_dev);
-			dev_put(dest_dev);
-			DEBUG_WARN("%px: src_dev=%s and dest_dev=%s are unregistered\n", msg,
-					src_dev->name, dest_dev->name);
-			this_cpu_inc(si->stats_pcpu->connection_create_failures64);
-			return -EINVAL;
-		}
-		dev_put(dest_dev);
-		if (if_rule->if_mtu < if_min_mtu) {
-			if_min_mtu = if_rule->if_mtu;
-		}
-	}
-
-#if (defined(SFE_MEM_PROFILE_MEDIUM) || defined(SFE_MEM_PROFILE_LOW))
-	if (si->num_connections  >= sfe_ipv4_max_conn_count()) {
-		this_cpu_inc(si->stats_pcpu->connection_create_requests_overflow64);
-		dev_put(src_dev);
-		if (net_ratelimit()) {
-			DEBUG_WARN("%px: Maximum connection count(%d), reached %d\n", msg, sfe_ipv4_max_conn_count(), si->num_connections);
-		}
-		return -EPERM;
-	}
-#endif
-
-	/*
-	 * Allocate the various connection tracking objects.
-	 */
-	c = (struct sfe_ipv4_connection *)kzalloc(sizeof(struct sfe_ipv4_connection), GFP_ATOMIC);
-	if (unlikely(!c)) {
-		DEBUG_WARN("%px: memory allocation of connection entry failed\n", msg);
-		this_cpu_inc(si->stats_pcpu->connection_create_failures64);
-		dev_put(src_dev);
-		return -ENOMEM;
-	}
-
-	original_cm = (struct sfe_ipv4_connection_match *)kzalloc(sizeof(struct sfe_ipv4_connection_match), GFP_ATOMIC);
-	if (unlikely(!original_cm)) {
-		DEBUG_WARN("%px: memory allocation of connection match entry failed\n", msg);
-		this_cpu_inc(si->stats_pcpu->connection_create_failures64);
-		kfree(c);
-		dev_put(src_dev);
-		return -ENOMEM;
-	}
-
-	INIT_LIST_HEAD_RCU(&(original_cm->mc_list));
-	this_cpu_inc(si->stats_pcpu->connection_create_requests64);
-
-	spin_lock_bh(&si->lock);
-
-	/*
-	 * Check to see if there is already a flow that matches the rule we're
-	 * trying to create.  If there is then we can't create a new one.
-	 */
-	c_old = sfe_ipv4_find_connection(si,
-					msg->tuple.protocol,
-					msg->tuple.flow_ip,
-					msg->tuple.flow_ident,
-					msg->tuple.return_ip,
-					msg->tuple.return_ident);
-
-	if (c_old != NULL) {
-		if (!(msg->rule_flags & SFE_MC_RULE_CREATE_FLAG_MC_UPDATE)) {
-			DEBUG_WARN("%px: Rule existing but not update message\n", msg);
-			goto update_done;
-		}
-
-		/*
-		 * If we already have the flow then it's likely that this
-		 * request to update multicast interface information
-		 * up-to-date information. Check and update accordingly.
-		 */
-		if (sfe_ipv4_update_mc_dest(c_old->original_match, msg)) {
-			this_cpu_inc(si->stats_pcpu->connection_create_failures64);
-		}
-update_done:
-		spin_unlock_bh(&si->lock);
-
-		kfree(original_cm);
-		kfree(c);
-
-		dev_put(src_dev);
-
-		DEBUG_TRACE("%px: connection update the dest interface list -  p:%d\n"
-			    "  s: %s:%pM:%pI4:%u, d: Multicast:%pM:%pI4:%u\n",
-			    msg, tuple->protocol,
-			    src_dev->name, msg->conn_rule.flow_mac, &tuple->flow_ip, ntohs(tuple->flow_ident),
-			    msg->conn_rule.return_mac, &tuple->return_ip, ntohs(tuple->return_ident));
-
-		return 0;
-	}
-
-	/*
-	 * Fill in the "original" direction connection matching object.
-	 * Note that the transmit MAC address is "dest_mac_xlate" because
-	 * we always know both ends of a connection by their translated
-	 * addresses and not their public addresses.
-	 */
-	original_cm->match_dev = src_dev;
-	original_cm->match_protocol = tuple->protocol;
-	original_cm->match_src_ip = tuple->flow_ip;
-	original_cm->match_src_port = (msg->rule_flags & SFE_RULE_CREATE_FLAG_NO_SRC_IDENT) ? 0 : tuple->flow_ident;
-	original_cm->match_dest_ip = tuple->return_ip;
-	original_cm->match_dest_port = tuple->return_ident;
-
-	original_cm->xlate_src_ip = msg->conn_rule.flow_ip_xlate;
-	original_cm->xlate_src_port = msg->conn_rule.flow_ident_xlate;
-
-	original_cm->xmit_dev_mtu = if_min_mtu;
-
-	original_cm->connection = c;
-	original_cm->counter_match = NULL;
-
-	if (msg->valid_flags & SFE_RULE_CREATE_MARK_VALID) {
-		original_cm->mark = msg->mark_rule.flow_mark;
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
-	}
-	if (msg->valid_flags & SFE_MC_RULE_CREATE_FLAG_QOS_VALID) {
-		original_cm->priority =  msg->qos_rule.flow_qos_tag;
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PRIORITY_REMARK;
-	}
-	if (msg->valid_flags & SFE_MC_RULE_CREATE_FLAG_DSCP_MARKING_VALID) {
-		original_cm->dscp = msg->dscp_rule.flow_dscp << SFE_IPV4_DSCP_SHIFT;
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_DSCP_REMARK;
-	}
-	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_BRIDGE_FLOW) {
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_FLOW;
-	}
-
-	/*
-	 * Mark SAWF metadata if the sawf tag is valid and set.
-	 */
-	original_cm->sawf_valid = false;
-	flow_sawf_tag = SFE_GET_SAWF_TAG(msg->sawf_rule.flow_mark);
-	if (likely(SFE_SAWF_TAG_IS_VALID(flow_sawf_tag))) {
-		original_cm->mark = msg->sawf_rule.flow_mark;
-		original_cm->svc_id = msg->sawf_rule.flow_svc_id;
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
-		original_cm->sawf_valid = true;
-	}
-
-	/*
-	 * For the incoming packet with vlan header, store vlan header to match
-	 * when l2 acceleration is enabled.
-	 */
-	if (msg->valid_flags & SFE_RULE_CREATE_VLAN_VALID) {
-		struct sfe_vlan_rule *vlan_primary_rule = &msg->vlan_primary_rule;
-		struct sfe_vlan_rule *vlan_secondary_rule = &msg->vlan_secondary_rule;
-
-		/*
-		 * Initialize ingress VLAN information.
-		 */
-		original_cm->ingress_vlan_hdr_cnt = 0;
-		memset(original_cm->ingress_vlan_hdr, 0, sizeof(struct sfe_vlan_hdr) * SFE_MAX_VLAN_DEPTH);
-
-		sfe_ipv4_match_entry_set_vlan_hdr(&(original_cm->ingress_vlan_hdr_cnt),
-				original_cm->ingress_vlan_hdr,
-				vlan_primary_rule->ingress_vlan_tag,
-				vlan_secondary_rule->ingress_vlan_tag);
-	}
-
-	if (((IPPROTO_GRE == tuple->protocol) || (IPPROTO_ESP == tuple->protocol)) &&
-					!sfe_ipv4_is_local_ip(si, original_cm->match_src_ip)) {
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PASSTHROUGH;
-	}
-
-#ifdef CONFIG_NF_FLOW_COOKIE
-	original_cm->flow_cookie = 0;
-#endif
-#ifdef CONFIG_XFRM
-	if (msg->valid_flags & SFE_RULE_CREATE_DIRECTION_VALID) {
-		original_cm->flow_accel = msg->direction_rule.flow_accel;
-	} else {
-		original_cm->flow_accel = 1;
-	}
-#endif
-
-	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_FLOW_SRC_INTERFACE_CHECK) {
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK;
-	}
-
-	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_FLOW_SRC_INTERFACE_CHECK_NO_FLUSH) {
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK_NO_FLUSH;
-	}
-
-	/*
-	 * For multicast, it is only valid in the flow direction.
-	 * Store PPPOE header to do ingress match when l2 acceleration is enabled.
-	 */
-	if (msg->valid_flags & SFE_RULE_CREATE_PPPOE_DECAP_VALID) {
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_DECAP;
-		original_cm->pppoe_session_id = msg->pppoe_rule.flow_pppoe_session_id;
-		ether_addr_copy(original_cm->pppoe_remote_mac, msg->pppoe_rule.flow_pppoe_remote_mac);
-	}
-
-	src_if_idx = src_dev->ifindex;
-
-	/*
-	 * the net_protocol handler will be used only in decap path
-	 * for non passthrough case.
-	 */
-	original_cm->proto = NULL;
-	original_cm->top_interface_dev = NULL;
-
-
-	original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MULTICAST;
-
-	if (0 != sfe_ipv4_create_mc_dest(original_cm, msg)) {
-		struct sfe_ipv4_mc_dest *cur, *next;
-		this_cpu_inc(si->stats_pcpu->connection_create_failures64);
-		list_for_each_entry_safe(cur, next, &original_cm->mc_list, list) {
-			list_del_rcu(&cur->list);
-			call_rcu(&cur->rcu, sfe_ipv4_free_mc_dest_rcu);
-		}
-		spin_unlock_bh(&si->lock);
-
-		kfree(original_cm);
-		kfree(c);
-		dev_put(src_dev);
-		return 0;
-	}
-
-	/*
-	 * Fill in the ipv4_connection object.
-	 */
-	c->protocol = tuple->protocol;
-	c->src_ip = tuple->flow_ip;
-	c->src_ip_xlate =  msg->conn_rule.flow_ip_xlate;
-	c->src_port = tuple->flow_ident;
-	c->src_port_xlate = msg->conn_rule.flow_ident_xlate;
-	c->original_dev = src_dev;
-	c->original_match = original_cm;
-	c->dest_ip = tuple->return_ip;
-	c->dest_ip_xlate = msg->conn_rule.return_ip_xlate;
-	c->dest_port = tuple->return_ident;
-	c->dest_port_xlate = msg->conn_rule.return_ident_xlate;
-	c->debug_read_seq = 0;
-	c->last_sync_jiffies = get_jiffies_64();
-	c->removed = false;
-
-	sfe_ipv4_insert_connection(si, c);
-
-	spin_unlock_bh(&si->lock);
-
-	/*
-	 * We have everything we need!
-	 */
-	DEBUG_INFO("%px: NEW Multicast connection - p: %d\n"
-		   "original_cm: match_dev=src_dev: %s %d %pM\n"
-		   " xmit_src_mac: %pM\n"
-		   " xmit_dest_mac: %pM\n"
-		   " flags: %x l2_hdr: %u\n"
-		   "flow_ip: %pI4:%u\n"
-		   "flow_ip_xlate: %pI4:%u\n"
-		   "flow_mac: %pM\n"
-		   "flags: valid=%x src_mac_valid=%x\n",
-		   c, tuple->protocol,
-		   original_cm->match_dev->name, original_cm->match_dev->ifindex, original_cm->match_dev->dev_addr,
-		   original_cm->xmit_src_mac, original_cm->xmit_dest_mac, original_cm->flags, original_cm->l2_hdr_size,
-		   &tuple->flow_ip, ntohs(tuple->flow_ident),
-		   &msg->conn_rule.flow_ip_xlate, ntohs(msg->conn_rule.flow_ident_xlate),
-		   msg->conn_rule.flow_mac,
-		   msg->valid_flags, msg->src_mac_rule.mac_valid_flags);
-
-	return 0;
-}
-
-/*
- * sfe_ipv4_destroy_mc_rule()
- *	destory a multicast forwarding rule.
- */
-void sfe_ipv4_destroy_mc_rule(struct sfe_ipv4_mc_rule_destroy_msg *msg)
-{
-	return sfe_ipv4_destroy_rule((struct sfe_ipv4_rule_destroy_msg *)msg);
-}
-
-/*
  * sfe_ipv4_create_rule()
  *	Create a forwarding rule.
  */
@@ -2037,8 +1150,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	struct net_device *dest_dev;
 	struct net_device *src_dev;
 	struct sfe_ipv4_5tuple *tuple = &msg->tuple;
-	void *orig_conn;
-	void *reply_conn;
 	s32 flow_interface_num = msg->conn_rule.flow_top_interface_num;
 	s32 return_interface_num = msg->conn_rule.return_top_interface_num;
 	struct net *net;
@@ -2046,23 +1157,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	unsigned int src_if_idx;
 	u32 flow_sawf_tag;
 	u32 return_sawf_tag;
-	sfe_fls_conn_create_t create_cb;
-
-	/*
-	 * When Qdisc rule is invalid i.e either there is no qdisc present or there are multiple qdisc
-	 * Add bottom interface and fast transmit flag for now.
-	 *
-	 * TODO: Remove this check once multiple qdisc check is added in SFE
-	 */
-	if (sfe_is_l2_feature_enabled()) {
-		if (!(msg->qdisc_rule.valid_flags & SFE_QDISC_RULE_FLOW_VALID)) {
-			msg->rule_flags |= SFE_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE;
-		}
-
-		if (!(msg->qdisc_rule.valid_flags & SFE_QDISC_RULE_RETURN_VALID)) {
-			msg->rule_flags |= SFE_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE;
-		}
-	}
 
 	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE) {
 		flow_interface_num = msg->conn_rule.flow_interface_num;
@@ -2137,21 +1231,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	spin_lock_bh(&si->lock);
 
 	/*
-	 * Check to see if max number of connection limit reached.
-	 */
-	if (si->num_connections  >= sfe_ipv4_max_conn_count()) {
-		spin_unlock_bh(&si->lock);
-		this_cpu_inc(si->stats_pcpu->connection_create_requests_overflow64);
-		kfree(reply_cm);
-		kfree(original_cm);
-		kfree(c);
-		dev_put(src_dev);
-		dev_put(dest_dev);
-		DEBUG_WARN("%px: Maximum connection count(%d), reached %d\n", msg, sfe_ipv4_max_conn_count(), si->num_connections);
-		return -EPERM;
-	}
-
-	/*
 	 * Check to see if there is already a flow that matches the rule we're
 	 * trying to create.  If there is then we can't create a new one.
 	 */
@@ -2170,7 +1249,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		 * request to create the connection rule contains more
 		 * up-to-date information. Check and update accordingly.
 		 */
-		sfe_ipv4_update_protocol_state(c_old, msg);
+		sfe_ipv4_update_protocol_state(c, msg);
 		spin_unlock_bh(&si->lock);
 
 		kfree(reply_cm);
@@ -2198,7 +1277,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	original_cm->match_dev = src_dev;
 	original_cm->match_protocol = tuple->protocol;
 	original_cm->match_src_ip = tuple->flow_ip;
-	original_cm->match_src_port = (msg->rule_flags & SFE_RULE_CREATE_FLAG_NO_SRC_IDENT) ? 0 : tuple->flow_ident;
+	original_cm->match_src_port = netif_is_vxlan(src_dev) ? 0 : tuple->flow_ident;
 	original_cm->match_dest_ip = tuple->return_ip;
 	original_cm->match_dest_port = tuple->return_ident;
 
@@ -2217,29 +1296,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		original_cm->xlate_src_port = 0;
 	}
 
-	if (tuple->protocol == IPPROTO_L2TP) {
-		original_cm->match_src_port = 0;
-		original_cm->match_dest_port = 0;
-		original_cm->xlate_src_port = 0;
-		original_cm->xlate_dest_port = 0;
-	}
-
 	original_cm->xmit_dev = dest_dev;
-
-	/*
-	 * Enable qdisc fast xmit path if single qdisc is present on non-bottom interface.
-	 * For qdisc is enabled on bottom interface alone, we use dev_queue_xmit() instead to transmit to bottom interface.
-	 */
-	if ((msg->valid_flags & SFE_RULE_CREATE_QDISC_RULE_VALID) &&
-			(msg->qdisc_rule.valid_flags & SFE_QDISC_RULE_RETURN_VALID) &&
-			(msg->qdisc_rule.return_qdisc_interface != msg->conn_rule.return_interface_num)) {
-		original_cm->xmit_dev = dev_get_by_index(&init_net, msg->qdisc_rule.return_qdisc_interface);
-		original_cm->qdisc_xmit_dev = dest_dev;
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_FAST_QDISC_XMIT;
-		DEBUG_TRACE("%p: Fast qdisc xmit flag is set for original_cm, xmit_dev: %s, qdisc_xmit_dev: %s\n",
-				msg, original_cm->xmit_dev->name, original_cm->qdisc_xmit_dev->name);
-	}
-
 	original_cm->xmit_dev_mtu = msg->conn_rule.return_mtu;
 
 	original_cm->connection = c;
@@ -2254,21 +1311,10 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		original_cm->mark = msg->mark_rule.flow_mark;
 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
 	}
-
 	if (msg->valid_flags & SFE_RULE_CREATE_QOS_VALID) {
-#if defined(SFE_PPE_QOS_SUPPORTED)
-
-		/*
-		 * SFE_QDISC_RULE_RETURN_PPE_QDISC_FAST_XMIT flag is set when qdisc is configured in flow direction
-		 */
-		if(msg->qdisc_rule.valid_flags & SFE_QDISC_RULE_RETURN_PPE_QDISC_FAST_XMIT) {
-			original_cm->int_pri = msg->qos_rule.flow_int_pri;
-		}
-#endif
 		original_cm->priority =  msg->qos_rule.flow_qos_tag;
 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PRIORITY_REMARK;
 	}
-
 	if (msg->valid_flags & SFE_RULE_CREATE_DSCP_MARKING_VALID) {
 		original_cm->dscp = msg->dscp_rule.flow_dscp << SFE_IPV4_DSCP_SHIFT;
 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_DSCP_REMARK;
@@ -2287,7 +1333,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	flow_sawf_tag = SFE_GET_SAWF_TAG(msg->sawf_rule.flow_mark);
 	if (likely(SFE_SAWF_TAG_IS_VALID(flow_sawf_tag))) {
 		original_cm->mark = msg->sawf_rule.flow_mark;
-		original_cm->svc_id = msg->sawf_rule.flow_svc_id;
 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
 		original_cm->sawf_valid = true;
 	}
@@ -2298,7 +1343,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	if (msg->valid_flags & SFE_RULE_CREATE_VLAN_VALID) {
 		struct sfe_vlan_rule *vlan_primary_rule = &msg->vlan_primary_rule;
 		struct sfe_vlan_rule *vlan_secondary_rule = &msg->vlan_secondary_rule;
-
 		sfe_ipv4_match_entry_set_vlan(original_cm,
 					     vlan_primary_rule->ingress_vlan_tag,
 					     vlan_primary_rule->egress_vlan_tag,
@@ -2312,52 +1356,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		}
 	}
 
-#ifdef SFE_BRIDGE_VLAN_FILTERING_ENABLE
-	/*
-	 * Add Bridge VLAN Filter rule in original_cm
-	 */
-	if (msg->valid_flags & SFE_RULE_CREATE_VLAN_FILTER_VALID) {
-		DEBUG_INFO("%px: Bridge VLAN Filter rule configuration received from connection manager in original dir\n"
-				" orig_cm:  vlan_filter_ingress_tag: %x flags: %x \n"
-				" orig_cm:  vlan_filter_egress_tag:  %x flags: %x \n",
-				msg, msg->flow_vlan_filter_rule.ingress_vlan_tag, msg->flow_vlan_filter_rule.ingress_flags,
-				msg->flow_vlan_filter_rule.egress_vlan_tag, msg->flow_vlan_filter_rule.egress_flags);
-
-		/*
-		 * Populate the VLAN Filter rule in the connection match entry.
-		 */
-		original_cm->vlan_filter_rule.ingress_vlan_tag = msg->flow_vlan_filter_rule.ingress_vlan_tag;
-		original_cm->vlan_filter_rule.ingress_flags = msg->flow_vlan_filter_rule.ingress_flags;
-
-		/*
-		 * Add VLAN Filter rule for ingress validation / egress tagging.
-		 * We might be stacking Bridge VLAN Filter headers after traditional VLAN headers. (not clearing out the arry).
-		 * This might fail, when both primary and secondary traditional VLANs have been configured.
-		 */
-		if (!sfe_ipv4_match_entry_set_vlan(original_cm, msg->flow_vlan_filter_rule.ingress_vlan_tag, msg->flow_vlan_filter_rule.egress_vlan_tag,
-					SFE_VLAN_ID_NOT_CONFIGURED, SFE_VLAN_ID_NOT_CONFIGURED)) {
-			this_cpu_inc(si->stats_pcpu->connection_create_failures64);
-			spin_unlock_bh(&si->lock);
-			kfree(reply_cm);
-			kfree(original_cm);
-			kfree(c);
-			dev_put(src_dev);
-			dev_put(dest_dev);
-			DEBUG_WARN("%px: More than %d VLAN & VLAN Filter rules are not allowed\n", msg, SFE_MAX_VLAN_DEPTH);
-			return -EPERM;
-		}
-
-		if (!(msg->flow_vlan_filter_rule.egress_flags & SFE_VLAN_FILTER_FLAG_EGRESS_UNTAGGED) &&
-			(original_cm->egress_vlan_hdr_cnt > 0)) {
-			original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG;
-			original_cm->l2_hdr_size += original_cm->egress_vlan_hdr_cnt * VLAN_HLEN;
-			DEBUG_TRACE("%px: original_cm: Bridge VLAN insert egress VLAN Tag found\n", msg);
-		}
-	}
-#endif
-
-	if (((IPPROTO_IPV6 == tuple->protocol) || (IPPROTO_GRE == tuple->protocol) || (IPPROTO_ESP == tuple->protocol) ||
-				(IPPROTO_L2TP == tuple->protocol)) && !sfe_ipv4_is_local_ip(si, original_cm->match_dest_ip)) {
+	if ((IPPROTO_GRE == tuple->protocol) && !sfe_ipv4_is_local_ip(si, original_cm->match_dest_ip)) {
 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PASSTHROUGH;
 	}
 
@@ -2373,15 +1372,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 #endif
 
 	/*
-	 * Check if TSO is enabled on the bottom interface. This flag is used for PPPoE TCP flows.
-	 * For PPPoE TCP flows, we can only use HW TSO since kernel does not support GSO for this path.
-	 */
-	if (unlikely(dest_dev->features & NETIF_F_TSO) && (msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_RETURN_BOTTOM_INTERFACE)) {
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_TSO_ENABLE;
-		DEBUG_TRACE("%px: TSO is enabled on the destination interface: %s", msg, dest_dev->name);
-	}
-
-	/*
 	 * If l2_features are disabled and flow uses l2 features such as macvlan/bridge/pppoe/vlan,
 	 * bottom interfaces are expected to be disabled in the flow rule and always top interfaces
 	 * are used. In such cases, do not use HW csum offload. csum offload is used only when we
@@ -2394,7 +1384,9 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 			/*
 			 * Dont enable CSUM offload
 			 */
+#if 0
 			original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD;
+#endif
 		}
 	}
 
@@ -2424,40 +1416,20 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		ether_addr_copy(original_cm->pppoe_remote_mac, msg->pppoe_rule.flow_pppoe_remote_mac);
 
 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP;
-		reply_cm->l2_hdr_size += PPPOE_SES_HLEN;
+		reply_cm->l2_hdr_size += SFE_PPPOE_SESSION_HEADER_SIZE;
 		reply_cm->pppoe_session_id = msg->pppoe_rule.flow_pppoe_session_id;
 		ether_addr_copy(reply_cm->pppoe_remote_mac, msg->pppoe_rule.flow_pppoe_remote_mac);
 	}
 
 	if (msg->valid_flags & SFE_RULE_CREATE_PPPOE_ENCAP_VALID) {
 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP;
-		original_cm->l2_hdr_size += PPPOE_SES_HLEN;
+		original_cm->l2_hdr_size += SFE_PPPOE_SESSION_HEADER_SIZE;
 		original_cm->pppoe_session_id = msg->pppoe_rule.return_pppoe_session_id;
 		ether_addr_copy(original_cm->pppoe_remote_mac, msg->pppoe_rule.return_pppoe_remote_mac);
 
 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_DECAP;
 		reply_cm->pppoe_session_id = msg->pppoe_rule.return_pppoe_session_id;
 		ether_addr_copy(reply_cm->pppoe_remote_mac, msg->pppoe_rule.return_pppoe_remote_mac);
-	}
-
-	/*
-	 * Disable HW CSUM Offload for connection with trustsec header
-	 */
-	if ((msg->valid_flags & SFE_RULE_CREATE_TRUSTSEC_VALID)) {
-		struct sfe_trustsec_rule *trustsec_rule = &msg->trustsec_rule;
-		sfe_ipv4_match_entry_set_trustsec(original_cm,
-						trustsec_rule->ingress_sgt,
-						trustsec_rule->egress_sgt);
-		original_cm->flags &= ~SFE_IPV4_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD;
-
-		if (trustsec_rule->sgt_valid_flags & SFE_TRUSTSEC_INGRESS_SGT_VALID) {
-			original_cm->ingress_trustsec_valid = true;
-		}
-
-		if (trustsec_rule->sgt_valid_flags & SFE_TRUSTSEC_EGRESS_SGT_VALID) {
-			original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_TRUSTSEC_SGT;
-		}
-
 	}
 
 	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_RETURN_SRC_INTERFACE_CHECK) {
@@ -2489,16 +1461,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 			}
 		}
 
-		/*
-		 * In route mode, the return mac address could be wrong since it
-		 * use to_nat device if destination is PPPoE device, using pppoe_remote_mac
-		 * is more safe
-		 */
-		if (original_cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP) {
-			ether_addr_copy((u8 *)original_cm->xmit_dest_mac, (u8 *)original_cm->pppoe_remote_mac);
-		} else {
-			ether_addr_copy((u8 *)original_cm->xmit_dest_mac, (u8 *)msg->conn_rule.return_mac);
-		}
+		ether_addr_copy((u8 *)original_cm->xmit_dest_mac, (u8 *)msg->conn_rule.return_mac);
 
 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_L2_HDR;
 		original_cm->l2_hdr_size += ETH_HLEN;
@@ -2515,21 +1478,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	}
 
 	/*
-	 * For a bridge flow we are checking the bridge vlan passthrough flag enabled from ECM
-	 * enable bridge vlan passthrough for the original and reply direction.
-	 */
-	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_BRIDGE_FLOW) {
-		/*
-		 * For the non-arp interface, we don't write L2 HDR.
-		 */
-		if ((original_cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_L2_HDR) && (msg->rule_flags & SFE_RULE_CREATE_FLAG_BRIDGE_VLAN_PASSTHROUGH)) {
-			if (!((msg->valid_flags & SFE_RULE_CREATE_VLAN_VALID) || (msg->valid_flags & SFE_RULE_CREATE_VLAN_FILTER_VALID))) {
-				original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_VLAN_PASSTHROUGH;
-			}
-		}
-	}
-
-	/*
 	 * Fill in the "reply" direction connection matching object.
 	 */
 	reply_cm->match_dev = dest_dev;
@@ -2537,9 +1485,13 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	reply_cm->match_src_ip = msg->conn_rule.return_ip_xlate;
 
 	/*
-	 * Keep source port as 0 for tunnels requiring 4-tuple match (eg: VxLAN).
+	 * Keep source port as 0 for VxLAN tunnels.
 	 */
-	reply_cm->match_src_port = (msg->rule_flags & SFE_RULE_CREATE_FLAG_NO_SRC_IDENT) ? 0 : msg->conn_rule.return_ident_xlate;
+	if (netif_is_vxlan(src_dev) || netif_is_vxlan(dest_dev)) {
+		reply_cm->match_src_port = 0;
+	} else {
+		reply_cm->match_src_port = msg->conn_rule.return_ident_xlate;
+	}
 
 	reply_cm->match_dest_ip = msg->conn_rule.flow_ip_xlate;
 	reply_cm->match_dest_port = msg->conn_rule.flow_ident_xlate;
@@ -2559,29 +1511,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		reply_cm->xlate_src_port = 0;
 	}
 
-	if (tuple->protocol == IPPROTO_L2TP) {
-		reply_cm->match_src_port = 0;
-		reply_cm->match_dest_port = 0;
-		reply_cm->xlate_src_port = 0;
-		reply_cm->xlate_dest_port = 0;
-
-	}
 	reply_cm->xmit_dev = src_dev;
-
-	/*
-	 * Enable qdisc fast xmit path if single qdisc is present on non-bottom interface.
-	 * For qdisc is enabled on bottom interface alone, we use dev_queue_xmit() instead to transmit to bottom interface.
-	 */
-	if ((msg->valid_flags & SFE_RULE_CREATE_QDISC_RULE_VALID) &&
-			(msg->qdisc_rule.valid_flags & SFE_QDISC_RULE_FLOW_VALID) &&
-			(msg->qdisc_rule.flow_qdisc_interface != msg->conn_rule.flow_interface_num)) {
-		reply_cm->xmit_dev = dev_get_by_index(&init_net, msg->qdisc_rule.flow_qdisc_interface);
-		reply_cm->qdisc_xmit_dev = src_dev;
-		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_FAST_QDISC_XMIT;
-		DEBUG_TRACE("%p: Fast qdisc xmit flag is set for reply_cm, xmit_dev: %s, qdisc_xmit_dev: %s\n",
-				msg, reply_cm->xmit_dev->name, reply_cm->qdisc_xmit_dev->name);
-	}
-
 	reply_cm->xmit_dev_mtu = msg->conn_rule.flow_mtu;
 
 	reply_cm->connection = c;
@@ -2591,18 +1521,8 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		reply_cm->mark = msg->mark_rule.return_mark;
 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
 	}
-
 	if (msg->valid_flags & SFE_RULE_CREATE_QOS_VALID) {
-#if defined(SFE_PPE_QOS_SUPPORTED)
-
-		/*
-		 * SFE_QDISC_RULE_FLOW_PPE_QDISC_FAST_XMIT flag is set when qdisc is configured in return direction
-		 */
-		if(msg->qdisc_rule.valid_flags & SFE_QDISC_RULE_FLOW_PPE_QDISC_FAST_XMIT) {
-			reply_cm->int_pri = msg->qos_rule.return_int_pri;
-		}
-#endif
-		reply_cm->priority =  msg->qos_rule.return_qos_tag;
+		reply_cm->priority = msg->qos_rule.return_qos_tag;
 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PRIORITY_REMARK;
 	}
 
@@ -2617,13 +1537,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_FAST_XMIT_DEV_ADMISSION;
 	}
 
-	if (sfe_is_l2_feature_enabled() && !(msg->rule_flags & SFE_RULE_CREATE_FLAG_BRIDGE_FLOW)) {
-		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PACKET_HOST;
-		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PACKET_HOST;
-	}
-
-	if (((IPPROTO_IPV6 == tuple->protocol) || (IPPROTO_GRE == tuple->protocol) || (IPPROTO_ESP == tuple->protocol)
-				|| (IPPROTO_L2TP == tuple->protocol)) && !sfe_ipv4_is_local_ip(si, reply_cm->match_dest_ip)) {
+	if ((IPPROTO_GRE == tuple->protocol) && !sfe_ipv4_is_local_ip(si, reply_cm->match_dest_ip)) {
 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_PASSTHROUGH;
 	}
 
@@ -2634,7 +1548,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	return_sawf_tag = SFE_GET_SAWF_TAG(msg->sawf_rule.return_mark);
 	if (likely(SFE_SAWF_TAG_IS_VALID(return_sawf_tag))) {
 		reply_cm->mark = msg->sawf_rule.return_mark;
-		reply_cm->svc_id = msg->sawf_rule.return_svc_id;
 		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_MARK;
 		reply_cm->sawf_valid = true;
 	}
@@ -2654,11 +1567,11 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	 * which will be released in sfe_ipv4_free_connection_rcu()
 	 */
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0))
-	sk = __udp4_lib_lookup(net, reply_cm->xlate_src_ip, reply_cm->xlate_src_port,
-			reply_cm->match_dest_ip, reply_cm->match_dest_port, src_if_idx, &udp_table);
+	sk = __udp4_lib_lookup(net, reply_cm->match_dest_ip, reply_cm->match_dest_port,
+			reply_cm->xlate_src_ip, reply_cm->xlate_src_port, src_if_idx, &udp_table);
 #else
-	sk = __udp4_lib_lookup(net, reply_cm->xlate_src_ip, reply_cm->xlate_src_port,
-			reply_cm->match_dest_ip, reply_cm->match_dest_port, src_if_idx, 0, &udp_table, NULL);
+	sk = __udp4_lib_lookup(net, reply_cm->match_dest_ip, reply_cm->match_dest_port,
+			reply_cm->xlate_src_ip, reply_cm->xlate_src_port, src_if_idx, 0, &udp_table, NULL);
 #endif
 
 	rcu_read_unlock();
@@ -2721,49 +1634,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		}
 	}
 
-#ifdef SFE_BRIDGE_VLAN_FILTERING_ENABLE
-	/*
-	 * Add Bridge VLAN Filter rule in reply_cm
-	 */
-	if (msg->valid_flags & SFE_RULE_CREATE_VLAN_FILTER_VALID) {
-		DEBUG_INFO("%px: Bridge VLAN Filter rule configuration received from connection manager in reply dir\n"
-				" reply_cm: vlan_filter_ingress_tag: %x flags: %x \n"
-				" reply_cm: vlan_filter_egress_tag:  %x flags: %x \n",
-				msg, msg->return_vlan_filter_rule.ingress_vlan_tag, msg->return_vlan_filter_rule.ingress_flags,
-				msg->return_vlan_filter_rule.egress_vlan_tag, msg->return_vlan_filter_rule.egress_flags);
-
-		/*
-		 * Populate the VLAN Filter rule in the connection match entry.
-		 */
-		reply_cm->vlan_filter_rule.ingress_vlan_tag = msg->return_vlan_filter_rule.ingress_vlan_tag;
-		reply_cm->vlan_filter_rule.ingress_flags = msg->return_vlan_filter_rule.ingress_flags;
-
-		/*
-		 * Add VLAN Filter rule.
-		 * This might fail, when both primary and secondary traditional vlan has been configured.
-		 */
-		if (!sfe_ipv4_match_entry_set_vlan(reply_cm, msg->return_vlan_filter_rule.ingress_vlan_tag, msg->return_vlan_filter_rule.egress_vlan_tag,
-					SFE_VLAN_ID_NOT_CONFIGURED, SFE_VLAN_ID_NOT_CONFIGURED)) {
-			this_cpu_inc(si->stats_pcpu->connection_create_failures64);
-			spin_unlock_bh(&si->lock);
-			kfree(reply_cm);
-			kfree(original_cm);
-			kfree(c);
-			dev_put(src_dev);
-			dev_put(dest_dev);
-			DEBUG_WARN("%px: More than %d VLAN & VLAN Filter rules are not allowed\n", msg, SFE_MAX_VLAN_DEPTH);
-			return -EPERM;
-		}
-
-		if (!(msg->return_vlan_filter_rule.egress_flags & SFE_VLAN_FILTER_FLAG_EGRESS_UNTAGGED) &&
-			(reply_cm->egress_vlan_hdr_cnt > 0)) {
-			reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG;
-			reply_cm->l2_hdr_size += reply_cm->egress_vlan_hdr_cnt * VLAN_HLEN;
-			DEBUG_TRACE("%px: reply_cm: Bridge VLAN insert egress VLAN Tag found\n", msg);
-		}
-	}
-#endif
-
 	/*
 	 * the net_protocol handler will be used only in decap path
 	 * for non passthrough case.
@@ -2793,27 +1663,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	}
 #endif
 
-#ifdef SFE_L2TPV3_ENABLED
-	if ((IPPROTO_L2TP == tuple->protocol) && !(reply_cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PASSTHROUGH)) {
-		rcu_read_lock();
-		reply_cm->proto = rcu_dereference(inet_protos[IPPROTO_L2TP]);
-		rcu_read_unlock();
-
-		if (unlikely(!reply_cm->proto)) {
-			this_cpu_inc(si->stats_pcpu->connection_create_failures64);
-			spin_unlock_bh(&si->lock);
-			kfree(reply_cm);
-			kfree(original_cm);
-			kfree(c);
-			dev_put(src_dev);
-			dev_put(dest_dev);
-			DEBUG_WARN("sfe: L2TP proto handler is not registered\n");
-			return -EPERM;
-		}
-	}
-#endif
-
-	if (IPPROTO_IPV6 == tuple->protocol && !(reply_cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PASSTHROUGH)) {
+	if (IPPROTO_IPV6 == tuple->protocol) {
 		original_cm->proto = NULL;
 		rcu_read_lock();
 		reply_cm->proto = rcu_dereference(inet_protos[IPPROTO_IPV6]);
@@ -2834,22 +1684,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		}
 	}
 
-	if ((IPPROTO_ESP == tuple->protocol) && !(reply_cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PASSTHROUGH)) {
-		rcu_read_lock();
-		reply_cm->proto = rcu_dereference(inet_protos[IPPROTO_ESP]);
-		rcu_read_unlock();
-
-		if (unlikely(!reply_cm->proto)) {
-			kfree(reply_cm);
-			kfree(original_cm);
-			kfree(c);
-			dev_put(src_dev);
-			dev_put(dest_dev);
-			DEBUG_WARN("sfe: ESP proto handler is not registered\n");
-			return -EPERM;
-		}
-	}
-
 #ifdef CONFIG_NF_FLOW_COOKIE
 	reply_cm->flow_cookie = 0;
 #endif
@@ -2861,16 +1695,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	}
 
 #endif
-
-	/*
-	 * Check if TSO is enabled on the bottom interface. This flag is used for PPPoE TCP flows.
-	 * For PPPoE TCP flows, we can only use HW TSO since kernel does not support GSO for this path.
-	 */
-	if (unlikely(src_dev->features & NETIF_F_TSO) && (msg->rule_flags & SFE_RULE_CREATE_FLAG_USE_FLOW_BOTTOM_INTERFACE)) {
-		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_TSO_ENABLE;
-		DEBUG_TRACE("%px: TSO is enabled on the source interface: %s", msg, src_dev->name);
-	}
-
 	/*
 	 * If l2_features are disabled and flow uses l2 features such as macvlan/bridge/pppoe/vlan,
 	 * bottom interfaces are expected to be disabled in the flow rule and always top interfaces
@@ -2883,28 +1707,9 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 			/*
 			 * Dont enable CSUM offload
 			 */
+#if 0
 			 reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD;
-		}
-	}
-
-	/*
-	 * Disable HW CSUM Offload for connection with trustsec header
-	 */
-	if ((msg->valid_flags & SFE_RULE_CREATE_TRUSTSEC_VALID)) {
-		struct sfe_trustsec_rule *trustsec_rule = &msg->trustsec_rule;
-		sfe_ipv4_match_entry_set_trustsec(reply_cm,
-						trustsec_rule->egress_sgt,
-						trustsec_rule->ingress_sgt);
-		reply_cm->flags &= ~SFE_IPV4_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD;
-
-		reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_TRUSTSEC_SGT;
-
-		if (trustsec_rule->sgt_valid_flags & SFE_TRUSTSEC_EGRESS_SGT_VALID) {
-			reply_cm->ingress_trustsec_valid = true;
-		}
-
-		if (trustsec_rule->sgt_valid_flags & SFE_TRUSTSEC_INGRESS_SGT_VALID) {
-			original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_TRUSTSEC_SGT;
+#endif
 		}
 	}
 
@@ -2945,21 +1750,6 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		}
 	}
 
-	/*
-	 * For a bridge flow we are checking the bridge vlan passthrough flag enabled from ECM
-	 * enable bridge vlan passthrough for the original and reply direction.
-	 */
-	if (msg->rule_flags & SFE_RULE_CREATE_FLAG_BRIDGE_FLOW) {
-		/*
-		 * For the non-arp interface, we don't write L2 HDR.
-		 */
-		if ((reply_cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_L2_HDR) && (msg->rule_flags & SFE_RULE_CREATE_FLAG_BRIDGE_VLAN_PASSTHROUGH)) {
-			if (!((msg->valid_flags & SFE_RULE_CREATE_VLAN_VALID) || (msg->valid_flags & SFE_RULE_CREATE_VLAN_FILTER_VALID))) {
-				reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_VLAN_PASSTHROUGH;
-			}
-		}
-	}
-
 	if ((tuple->return_ip != msg->conn_rule.return_ip_xlate) ||
 				(tuple->return_ident != msg->conn_rule.return_ident_xlate)) {
 		original_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_XLATE_DEST;
@@ -2992,42 +1782,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 			reply_cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_NO_SEQ_CHECK;
 		}
 		break;
-
-	case IPPROTO_RAW:
-		/*
-		 * Set src_port to 0 to avoid hash collision in connection match lookups.
-		 */
-		original_cm->match_src_port = 0;
-		original_cm->xlate_src_port = 0;
-		reply_cm->match_src_port = 0;
-		reply_cm->xlate_src_port = 0;
-		break;
 	}
-
-	rcu_read_lock();
-	create_cb = rcu_dereference(sfe_fls_info.create_cb);
-	if (create_cb) {
-		create_cb(4, original_cm->match_protocol,
-				&original_cm->match_src_ip,
-				original_cm->match_src_port,
-				&original_cm->match_dest_ip,
-				original_cm->match_dest_port,
-				&reply_cm->match_src_ip,
-				reply_cm->match_src_port,
-				&reply_cm->match_dest_ip,
-				reply_cm->match_dest_port,
-				&orig_conn,
-				&reply_conn);
-
-		/*
-		 * TODO: Set FLS_DISABLED flag by default and unset when fls_conn is set.
-		 */
-		if (orig_conn && reply_conn) {
-			original_cm->fls_conn = orig_conn;
-			reply_cm->fls_conn = reply_conn;
-		}
-	}
-	rcu_read_unlock();
 
 	/*
 	 * Fill in the ipv4_connection object.
@@ -3058,7 +1813,7 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 	/*
 	 * We have everything we need!
 	 */
-	DEBUG_INFO("%px: NEW connection - p: %d\n"
+	DEBUG_INFO("NEW connection - p: %d\n"
 		   "original_cm: match_dev=src_dev: %s %d %pM\n"
 		   " xmit_dev=dest_dev: %s %d %pM\n"
 		   " xmit_src_mac: %pM\n"
@@ -3075,9 +1830,8 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		   "return_ip: %pI4:%u\n"
 		   "return_ip_xlate: %pI4:%u\n"
 		   "return_mac: %pM\n"
-		   "flags: valid=%x src_mac_valid=%x\n"
-		   "qdisc_rule: valid=%x flow_qdisc_interface=%d return_qdisc_interface=%d",
-		   c, tuple->protocol,
+		   "flags: valid=%x src_mac_valid=%x\n",
+		   tuple->protocol,
 		   original_cm->match_dev->name, original_cm->match_dev->ifindex, original_cm->match_dev->dev_addr,
 		   original_cm->xmit_dev->name, original_cm->xmit_dev->ifindex, original_cm->xmit_dev->dev_addr,
 		   original_cm->xmit_src_mac, original_cm->xmit_dest_mac, original_cm->flags, original_cm->l2_hdr_size,
@@ -3090,50 +1844,10 @@ int sfe_ipv4_create_rule(struct sfe_ipv4_rule_create_msg *msg)
 		   &tuple->return_ip, ntohs(tuple->return_ident),
 		   &msg->conn_rule.return_ip_xlate, ntohs(msg->conn_rule.return_ident_xlate),
 		   msg->conn_rule.return_mac,
-		   msg->valid_flags, msg->src_mac_rule.mac_valid_flags,
-		   msg->qdisc_rule.valid_flags, msg->qdisc_rule.flow_qdisc_interface, msg->qdisc_rule.return_qdisc_interface);
+		   msg->valid_flags, msg->src_mac_rule.mac_valid_flags);
 
-#ifdef SFE_BRIDGE_VLAN_FILTERING_ENABLE
-	DEBUG_INFO("%px: NEW connection - Bridge VLAN Filter Rule:\n"
-		   " original_cm: vlan_filter_ingress_tag: %x flags: %x \n"
-		   " reply_cm:    vlan_filter_ingress_tag: %x flags: %x \n",
-		   c, original_cm->vlan_filter_rule.ingress_vlan_tag, original_cm->vlan_filter_rule.ingress_flags,
-		   reply_cm->vlan_filter_rule.ingress_vlan_tag, reply_cm->vlan_filter_rule.ingress_flags);
-#endif
 	return 0;
 }
-
-#if defined(SFE_RFS_SUPPORTED)
-/*
- * sfe_ipv4_fill_connection_dev()
- */
-void sfe_ipv4_fill_connection_dev(struct sfe_ipv4_rule_destroy_msg *msg, struct net_device **original_dev, struct net_device **reply_dev)
-{
-	struct sfe_ipv4 *si = &__si;
-	struct sfe_ipv4_connection *c;
-	struct sfe_ipv4_5tuple *tuple = &msg->tuple;
-
-	this_cpu_inc(si->stats_pcpu->connection_destroy_requests64);
-	spin_lock_bh(&si->lock);
-
-	/*
-	 * Check to see if we have a flow that matches the rule we're trying
-	 * to destroy.  If there isn't then we can't destroy it.
-	 */
-	c = sfe_ipv4_find_connection(si, tuple->protocol, tuple->flow_ip, tuple->flow_ident,
-					      tuple->return_ip, tuple->return_ident);
-	if (!c) {
-		*original_dev = NULL;
-		*reply_dev = NULL;
-		spin_unlock_bh(&si->lock);
-		return;
-	}
-
-	*original_dev = c->original_dev;
-	*reply_dev = c->reply_dev;
-	spin_unlock_bh(&si->lock);
-}
-#endif
 
 /*
  * sfe_ipv4_destroy_rule()
@@ -3325,7 +2039,7 @@ static void sfe_ipv4_periodic_sync(struct work_struct *work)
 	while (likely(c && quota)) {
 		struct sfe_ipv4_connection_match *cm;
 		struct sfe_ipv4_connection_match *counter_cm;
-		struct sfe_connection_sync sis = {/*zero*/};
+		struct sfe_connection_sync sis;
 
 		cm = c->original_match;
 		counter_cm = c->reply_match;
@@ -3334,7 +2048,7 @@ static void sfe_ipv4_periodic_sync(struct work_struct *work)
 		 * Didn't receive packets in the original direction or reply
 		 * direction, move to the next connection.
 		 */
-		if ((!atomic_read(&cm->rx_packet_count)) && (!counter_cm || !(atomic_read(&counter_cm->rx_packet_count)))) {
+		if ((!atomic_read(&cm->rx_packet_count)) && !(atomic_read(&counter_cm->rx_packet_count))) {
 			c = c->all_connections_next;
 			continue;
 		}
@@ -3372,69 +2086,63 @@ static void sfe_ipv4_periodic_sync(struct work_struct *work)
 	sync_rule_callback(sfe_ipv4_sync_many_msg);
 }
 
+#define CHAR_DEV_MSG_SIZE 768
+
 /*
  * sfe_ipv4_debug_dev_read_start()
  *	Generate part of the XML output.
  */
-static int sfe_ipv4_debug_dev_read_start(struct sfe_ipv4 *si, char *buffer, char *msg, size_t length,
+static bool sfe_ipv4_debug_dev_read_start(struct sfe_ipv4 *si, char *buffer, char *msg, size_t *length,
 		int *total_read, struct sfe_ipv4_debug_xml_write_state *ws)
 {
 	int bytes_read;
 
 	si->debug_read_seq++;
 
-	bytes_read = snprintf(msg, length, "<sfe_ipv4>\n");
-
-	if ((bytes_read + *total_read) >= length) {
-		return -ENOMEM;
+	bytes_read = snprintf(msg, CHAR_DEV_MSG_SIZE, "<sfe_ipv4>\n");
+	if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
+		return false;
 	}
 
-	if (copy_to_user(buffer + *total_read, msg, bytes_read)) {
-		return -EFAULT;
-	}
-
+	*length -= bytes_read;
 	*total_read += bytes_read;
 
 	ws->state++;
-	return 0;
+	return true;
 }
 
 /*
  * sfe_ipv4_debug_dev_read_connections_start()
  *	Generate part of the XML output.
  */
-static int sfe_ipv4_debug_dev_read_connections_start(struct sfe_ipv4 *si, char *buffer, char *msg, size_t length,
+static bool sfe_ipv4_debug_dev_read_connections_start(struct sfe_ipv4 *si, char *buffer, char *msg, size_t *length,
 						      int *total_read, struct sfe_ipv4_debug_xml_write_state *ws)
 {
 	int bytes_read;
 
-	bytes_read = snprintf(msg, length, "\t<connections>\n");
-
-	if ((bytes_read + *total_read) >= length) {
-		return -ENOMEM;
+	bytes_read = snprintf(msg, CHAR_DEV_MSG_SIZE, "\t<connections>\n");
+	if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
+		return false;
 	}
 
-	if (copy_to_user(buffer + *total_read, msg, bytes_read)) {
-		return -EFAULT;
-	}
-
+	*length -= bytes_read;
 	*total_read += bytes_read;
 
 	ws->state++;
-	return 0;
+	return true;
 }
 
 /*
  * sfe_ipv4_debug_dev_read_connections_connection()
  *	Generate part of the XML output.
  */
-static int sfe_ipv4_debug_dev_read_connections_connection(struct sfe_ipv4 *si, char *buffer, char *msg, size_t length,
+static bool sfe_ipv4_debug_dev_read_connections_connection(struct sfe_ipv4 *si, char *buffer, char *msg, size_t *length,
 							   int *total_read, struct sfe_ipv4_debug_xml_write_state *ws)
 {
 	struct sfe_ipv4_connection *c;
 	struct sfe_ipv4_connection_match *original_cm;
 	struct sfe_ipv4_connection_match *reply_cm;
-	int bytes_read = 0;
+	int bytes_read;
 	int protocol;
 	struct net_device *src_dev;
 	__be32 src_ip;
@@ -3453,7 +2161,7 @@ static int sfe_ipv4_debug_dev_read_connections_connection(struct sfe_ipv4 *si, c
 	u64 last_sync_jiffies;
 	u32 src_mark, dest_mark, src_priority, dest_priority, src_dscp, dest_dscp;
 	bool original_cm_sawf_valid, reply_cm_sawf_valid;
-	u32 flow_svc_id, return_svc_id;
+	u32 flow_service_class, return_service_class;
 	u32 flow_msduq, return_msduq;
 	u32 packet, byte, original_cm_flags;
 	u16 pppoe_session_id;
@@ -3467,6 +2175,7 @@ static int sfe_ipv4_debug_dev_read_connections_connection(struct sfe_ipv4 *si, c
 
 	for (c = si->all_connections_head; c; c = c->all_connections_next) {
 		if (c->debug_read_seq < si->debug_read_seq) {
+			c->debug_read_seq = si->debug_read_seq;
 			break;
 		}
 	}
@@ -3477,7 +2186,7 @@ static int sfe_ipv4_debug_dev_read_connections_connection(struct sfe_ipv4 *si, c
 	if (!c || c->removed) {
 		spin_unlock_bh(&si->lock);
 		ws->state++;
-		return 0;
+		return true;
 	}
 
 	original_cm = c->original_match;
@@ -3493,6 +2202,7 @@ static int sfe_ipv4_debug_dev_read_connections_connection(struct sfe_ipv4 *si, c
 	src_dscp = original_cm->dscp >> SFE_IPV4_DSCP_SHIFT;
 
 	sfe_ipv4_connection_match_update_summary_stats(original_cm, &packet, &byte);
+	sfe_ipv4_connection_match_update_summary_stats(reply_cm, &packet, &byte);
 
 	src_rx_packets = original_cm->rx_packet_count64;
 	src_rx_bytes = original_cm->rx_byte_count64;
@@ -3503,48 +2213,29 @@ static int sfe_ipv4_debug_dev_read_connections_connection(struct sfe_ipv4 *si, c
 	dest_ip_xlate = c->dest_ip_xlate;
 	dest_port = c->dest_port;
 	dest_port_xlate = c->dest_port_xlate;
-	if (reply_cm) {
-		sfe_ipv4_connection_match_update_summary_stats(reply_cm, &packet, &byte);
-		dest_priority = reply_cm->priority;
-		dest_dscp = reply_cm->dscp >> SFE_IPV4_DSCP_SHIFT;
-		dest_rx_packets = reply_cm->rx_packet_count64;
-		dest_rx_bytes = reply_cm->rx_byte_count64;
-		dest_mark = reply_cm->mark;
-		reply_fast_xmit = (reply_cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_FAST_XMIT);
-		reply_cm_sawf_valid = reply_cm->sawf_valid;
-		return_svc_id = reply_cm->svc_id;
-		return_msduq = reply_cm->mark;
-#ifdef CONFIG_NF_FLOW_COOKIE
-		dst_flow_cookie = reply_cm->flow_cookie;
-#endif
-
-	} else {
-		dest_priority = 0;
-		dest_dscp = 0;
-		dest_rx_packets = 0;
-		dest_rx_bytes = 0;
-		dest_mark = 0;
-		reply_fast_xmit = 0;
-		reply_cm_sawf_valid = 0;
-		return_svc_id = 0;
-		return_msduq = 0;
-#ifdef CONFIG_NF_FLOW_COOKIE
-		dst_flow_cookie = 0;
-#endif
-	}
+	dest_priority = reply_cm->priority;
+	dest_dscp = reply_cm->dscp >> SFE_IPV4_DSCP_SHIFT;
+	dest_rx_packets = reply_cm->rx_packet_count64;
+	dest_rx_bytes = reply_cm->rx_byte_count64;
+	dest_mark = reply_cm->mark;
+	reply_fast_xmit = (reply_cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_FAST_XMIT);
 	last_sync_jiffies = get_jiffies_64() - c->last_sync_jiffies;
 	original_cm_flags = original_cm->flags;
 	pppoe_session_id = original_cm->pppoe_session_id;
 	ether_addr_copy(pppoe_remote_mac, original_cm->pppoe_remote_mac);
 	original_cm_sawf_valid = original_cm->sawf_valid;
-	flow_svc_id = original_cm->svc_id;
-	flow_msduq = original_cm->mark;
+	reply_cm_sawf_valid = reply_cm->sawf_valid;
+	flow_service_class = SFE_GET_SAWF_SERVICE_CLASS(original_cm->mark);
+	flow_msduq = SFE_GET_SAWF_MSDUQ(original_cm->mark);
+	return_service_class = SFE_GET_SAWF_SERVICE_CLASS(reply_cm->mark);
+	return_msduq = SFE_GET_SAWF_MSDUQ(reply_cm->mark);
 #ifdef CONFIG_NF_FLOW_COOKIE
 	src_flow_cookie = original_cm->flow_cookie;
+	dst_flow_cookie = reply_cm->flow_cookie;
 #endif
 	spin_unlock_bh(&si->lock);
 
-	bytes_read = snprintf(msg, length - bytes_read, "\t\t<connection "
+	bytes_read = snprintf(msg, CHAR_DEV_MSG_SIZE, "\t\t<connection "
 				"protocol=\"%u\" "
 				"src_dev=\"%s\" "
 				"src_ip=\"%pI4\" src_ip_xlate=\"%pI4\" "
@@ -3584,140 +2275,80 @@ static int sfe_ipv4_debug_dev_read_connections_connection(struct sfe_ipv4 *si, c
 #endif
 				last_sync_jiffies);
 
-	if ((length - bytes_read) <= 0) {
-		return -ENOMEM;
-	}
-
 	if (original_cm_flags &= (SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_DECAP | SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP)) {
-		bytes_read += snprintf(msg + bytes_read, length - bytes_read, "pppoe_session_id=\"%u\" pppoe_server MAC=\"%pM\" ",
+		bytes_read += snprintf(msg + bytes_read, CHAR_DEV_MSG_SIZE, "pppoe_session_id=\"%u\" pppoe_server MAC=\"%pM\" ",
 				pppoe_session_id, pppoe_remote_mac);
 	}
 
-	if ((length - bytes_read) <= 0) {
-		return -ENOMEM;
-	}
-
 	if (original_cm_sawf_valid) {
-		bytes_read += snprintf(msg + bytes_read, length - bytes_read, "flow_service_class=\"%d\" flow_msduq = \"0x%x\" ",
-				flow_svc_id, flow_msduq);
-	}
-
-	if ((length - bytes_read) <= 0) {
-		return -ENOMEM;
+		bytes_read += snprintf(msg + bytes_read, CHAR_DEV_MSG_SIZE, "flow_service_class=\"%d\" flow_msduq = \"0x%x\" ",
+				flow_service_class, flow_msduq);
 	}
 
 	if (reply_cm_sawf_valid) {
-		bytes_read += snprintf(msg + bytes_read, length - bytes_read, "return_service_class=\"%d\" return_msduq = \"0x%x\" ",
-				return_svc_id, return_msduq);
+		bytes_read += snprintf(msg + bytes_read, CHAR_DEV_MSG_SIZE, "return_service_class=\"%d\" return_msduq = \"0x%x\" ",
+				return_service_class, return_msduq);
 	}
 
-	if (original_cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_MULTICAST) {
-		struct sfe_ipv4_mc_dest *mc_xmit_dev;
-		int vlan_hdr_cnt;
-		list_for_each_entry_rcu(mc_xmit_dev, &(original_cm->mc_list), list) {
-			 u32 fast_xmit = mc_xmit_dev->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_FAST_XMIT;
-			 vlan_hdr_cnt = mc_xmit_dev->egress_vlan_hdr_cnt;
+	bytes_read += snprintf(msg + bytes_read, CHAR_DEV_MSG_SIZE, "/>\n");
 
-			 if ((length - bytes_read) <= 0) {
-				 return -ENOMEM;
-			 }
-
-			 bytes_read += snprintf(msg + bytes_read,
-					 length - bytes_read, "mc_dev=\"%s\" mc_dmac=\"%pM\" mc_smac=\"%pM\" fast_xmit=\"%s\" vlan_cnt=\"%d\"",
-					 mc_xmit_dev->xmit_dev->name,
-					 mc_xmit_dev->xmit_dest_mac,
-					 mc_xmit_dev->xmit_src_mac,
-					 fast_xmit?"Yes":"No",
-					 vlan_hdr_cnt);
-		 }
-
+	if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
+		return false;
 	}
 
-	if (original_cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_VLAN_PASSTHROUGH) {
-
-		if ((length - bytes_read) <= 0) {
-			return -ENOMEM;
-		}
-
-		bytes_read += snprintf(msg + bytes_read, length - bytes_read, "bridge_vlan_passthrough=\"Yes\"");
-	}
-
-	if ((length - bytes_read) <= 0) {
-		return -ENOMEM;
-	}
-
-	bytes_read += snprintf(msg + bytes_read, length - bytes_read, "/>\n");
-
-	if ((bytes_read + *total_read) >= length) {
-		return -ENOMEM;
-	}
-
-	if (copy_to_user(buffer + *total_read, msg, bytes_read)) {
-		return -EFAULT;
-	}
-
+	*length -= bytes_read;
 	*total_read += bytes_read;
 
-	c->debug_read_seq = si->debug_read_seq;
-
-	return 0;
+	return true;
 }
 
 /*
  * sfe_ipv4_debug_dev_read_connections_end()
  *	Generate part of the XML output.
  */
-static int sfe_ipv4_debug_dev_read_connections_end(struct sfe_ipv4 *si, char *buffer, char *msg, size_t length,
+static bool sfe_ipv4_debug_dev_read_connections_end(struct sfe_ipv4 *si, char *buffer, char *msg, size_t *length,
 						    int *total_read, struct sfe_ipv4_debug_xml_write_state *ws)
 {
 	int bytes_read;
 
-	bytes_read = snprintf(msg, length, "\t</connections>\n");
-
-	if ((bytes_read + *total_read) >= length) {
-		return -ENOMEM;
+	bytes_read = snprintf(msg, CHAR_DEV_MSG_SIZE, "\t</connections>\n");
+	if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
+		return false;
 	}
 
-	if (copy_to_user(buffer + *total_read, msg, bytes_read)) {
-		return -EFAULT;
-	}
-
+	*length -= bytes_read;
 	*total_read += bytes_read;
 
 	ws->state++;
-	return 0;
+	return true;
 }
 
 /*
  * sfe_ipv4_debug_dev_read_exceptions_start()
  *	Generate part of the XML output.
  */
-static int sfe_ipv4_debug_dev_read_exceptions_start(struct sfe_ipv4 *si, char *buffer, char *msg, size_t length,
+static bool sfe_ipv4_debug_dev_read_exceptions_start(struct sfe_ipv4 *si, char *buffer, char *msg, size_t *length,
 						     int *total_read, struct sfe_ipv4_debug_xml_write_state *ws)
 {
 	int bytes_read;
 
-	bytes_read = snprintf(msg, length, "\t<exceptions>\n");
-
-	if ((bytes_read + *total_read) >= length) {
-		return -ENOMEM;
+	bytes_read = snprintf(msg, CHAR_DEV_MSG_SIZE, "\t<exceptions>\n");
+	if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
+		return false;
 	}
 
-	if (copy_to_user(buffer + *total_read, msg, bytes_read)) {
-		return -EFAULT;
-	}
-
+	*length -= bytes_read;
 	*total_read += bytes_read;
 
 	ws->state++;
-	return 0;
+	return true;
 }
 
 /*
  * sfe_ipv4_debug_dev_read_exceptions_exception()
  *	Generate part of the XML output.
  */
-static int sfe_ipv4_debug_dev_read_exceptions_exception(struct sfe_ipv4 *si, char *buffer, char *msg, size_t length,
+static bool sfe_ipv4_debug_dev_read_exceptions_exception(struct sfe_ipv4 *si, char *buffer, char *msg, size_t *length,
 							 int *total_read, struct sfe_ipv4_debug_xml_write_state *ws)
 {
 	int i;
@@ -3731,19 +2362,15 @@ static int sfe_ipv4_debug_dev_read_exceptions_exception(struct sfe_ipv4 *si, cha
 	if (val) {
 		int bytes_read;
 
-		bytes_read = snprintf(msg, length,
+		bytes_read = snprintf(msg, CHAR_DEV_MSG_SIZE,
 				      "\t\t<exception name=\"%s\" count=\"%llu\" />\n",
 				      sfe_ipv4_exception_events_string[ws->iter_exception],
 				      val);
-
-		if ((bytes_read + *total_read) >= length) {
-			return -ENOMEM;
+		if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
+			return false;
 		}
 
-		if (copy_to_user(buffer + *total_read, msg, bytes_read)) {
-			return -EFAULT;
-		}
-
+		*length -= bytes_read;
 		*total_read += bytes_read;
 	}
 
@@ -3753,39 +2380,35 @@ static int sfe_ipv4_debug_dev_read_exceptions_exception(struct sfe_ipv4 *si, cha
 		ws->state++;
 	}
 
-	return 0;
+	return true;
 }
 
 /*
  * sfe_ipv4_debug_dev_read_exceptions_end()
  *	Generate part of the XML output.
  */
-static int sfe_ipv4_debug_dev_read_exceptions_end(struct sfe_ipv4 *si, char *buffer, char *msg, size_t length,
+static bool sfe_ipv4_debug_dev_read_exceptions_end(struct sfe_ipv4 *si, char *buffer, char *msg, size_t *length,
 						   int *total_read, struct sfe_ipv4_debug_xml_write_state *ws)
 {
 	int bytes_read;
 
-	bytes_read = snprintf(msg, length, "\t</exceptions>\n");
-
-	if ((bytes_read + *total_read) >= length) {
-		return -ENOMEM;
+	bytes_read = snprintf(msg, CHAR_DEV_MSG_SIZE, "\t</exceptions>\n");
+	if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
+		return false;
 	}
 
-	if (copy_to_user(buffer + *total_read, msg, bytes_read)) {
-		return -EFAULT;
-	}
-
+	*length -= bytes_read;
 	*total_read += bytes_read;
 
 	ws->state++;
-	return 0;
+	return true;
 }
 
 /*
  * sfe_ipv4_debug_dev_read_stats()
  *	Generate part of the XML output.
  */
-static int sfe_ipv4_debug_dev_read_stats(struct sfe_ipv4 *si, char *buffer, char *msg, size_t length,
+static bool sfe_ipv4_debug_dev_read_stats(struct sfe_ipv4 *si, char *buffer, char *msg, size_t *length,
 					  int *total_read, struct sfe_ipv4_debug_xml_write_state *ws)
 {
 	int bytes_read;
@@ -3798,11 +2421,10 @@ static int sfe_ipv4_debug_dev_read_stats(struct sfe_ipv4 *si, char *buffer, char
 	num_conn = si->num_connections;
 	spin_unlock_bh(&si->lock);
 
-	bytes_read = snprintf(msg, length, "\t<stats "
+	bytes_read = snprintf(msg, CHAR_DEV_MSG_SIZE, "\t<stats "
 			      "num_connections=\"%u\" "
 			      "pkts_dropped=\"%llu\" "
 			      "pkts_fast_xmited=\"%llu\" "
-			      "pkts_fast_qdisc_xmited=\"%llu\" "
 			      "pkts_forwarded=\"%llu\" pkts_not_forwarded=\"%llu\" "
 			      "create_requests=\"%llu\" create_collisions=\"%llu\" "
 			      "create_failures=\"%llu\" "
@@ -3811,14 +2433,10 @@ static int sfe_ipv4_debug_dev_read_stats(struct sfe_ipv4 *si, char *buffer, char
 			      "hash_hits=\"%llu\" hash_reorders=\"%llu\" "
 			      "pppoe_encap_pkts_fwded=\"%llu\" "
 			      "pppoe_decap_pkts_fwded=\"%llu\" "
-			      "pppoe_bridge_pkts_fwded=\"%llu\" "
-			      "pppoe_bridge_pkts_3tuple_fwded=\"%llu\" "
-			      "connection_create_requests_overflow64=\"%llu\" "
-			      "bridge_vlan_passthorugh_forwarded64=\"%llu\" />\n",
+			      "pppoe_bridge_pkts_fwded=\"%llu\" />\n",
 				num_conn,
 				stats.packets_dropped64,
 				stats.packets_fast_xmited64,
-				stats.packets_fast_qdisc_xmited64,
 				stats.packets_forwarded64,
 				stats.packets_not_forwarded64,
 				stats.connection_create_requests64,
@@ -3831,48 +2449,37 @@ static int sfe_ipv4_debug_dev_read_stats(struct sfe_ipv4 *si, char *buffer, char
 				stats.connection_match_hash_reorders64,
 				stats.pppoe_encap_packets_forwarded64,
 				stats.pppoe_decap_packets_forwarded64,
-				stats.pppoe_bridge_packets_forwarded64,
-				stats.pppoe_bridge_packets_3tuple_forwarded64,
-				stats.connection_create_requests_overflow64,
-				stats.bridge_vlan_passthorugh_forwarded64);
-
-	if ((bytes_read + *total_read) >= length) {
-		return -ENOMEM;
+				stats.pppoe_bridge_packets_forwarded64);
+	if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
+		return false;
 	}
 
-	if (copy_to_user(buffer + *total_read, msg, bytes_read)) {
-		return -EFAULT;
-	}
-
+	*length -= bytes_read;
 	*total_read += bytes_read;
 
 	ws->state++;
-	return 0;
+	return true;
 }
 
 /*
  * sfe_ipv4_debug_dev_read_end()
  *	Generate part of the XML output.
  */
-static int sfe_ipv4_debug_dev_read_end(struct sfe_ipv4 *si, char *buffer, char *msg, size_t length,
+static bool sfe_ipv4_debug_dev_read_end(struct sfe_ipv4 *si, char *buffer, char *msg, size_t *length,
 					int *total_read, struct sfe_ipv4_debug_xml_write_state *ws)
 {
 	int bytes_read;
 
-	bytes_read = snprintf(msg, length, "</sfe_ipv4>\n");
-
-	if ((bytes_read + *total_read) >= length) {
-		return -ENOMEM;
+	bytes_read = snprintf(msg, CHAR_DEV_MSG_SIZE, "</sfe_ipv4>\n");
+	if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
+		return false;
 	}
 
-	if (copy_to_user(buffer + *total_read, msg, bytes_read)) {
-		return -EFAULT;
-	}
-
+	*length -= bytes_read;
 	*total_read += bytes_read;
 
 	ws->state++;
-	return 0;
+	return true;
 }
 
 /*
@@ -3897,50 +2504,18 @@ static sfe_ipv4_debug_xml_write_method_t sfe_ipv4_debug_xml_write_methods[SFE_IP
  */
 static ssize_t sfe_ipv4_debug_dev_read(struct file *filp, char *buffer, size_t length, loff_t *offset)
 {
+	char msg[CHAR_DEV_MSG_SIZE];
+	int total_read = 0;
 	struct sfe_ipv4_debug_xml_write_state *ws;
 	struct sfe_ipv4 *si = &__si;
-	int total_read = 0;
-	int null_fill;
-	int status = 0;
-	char *msg;
-
-	msg = kmalloc(length, GFP_KERNEL);
-	if (!msg) {
-		return -ENOMEM;
-	}
 
 	ws = (struct sfe_ipv4_debug_xml_write_state *)filp->private_data;
-	while ((ws->state != SFE_IPV4_DEBUG_XML_STATE_DONE)) {
-		status = sfe_ipv4_debug_xml_write_methods[ws->state](si, buffer, msg, length, &total_read, ws);
-		if (!status) {
+	while ((ws->state != SFE_IPV4_DEBUG_XML_STATE_DONE) && (length > CHAR_DEV_MSG_SIZE)) {
+		if ((sfe_ipv4_debug_xml_write_methods[ws->state])(si, buffer, msg, &length, &total_read, ws)) {
 			continue;
 		}
-
-		break;
 	}
 
-	if (status == -ENOMEM) {
-		/*
-		 * To request more buffer when we are short of it. Indicate that we have consumed whole buffer.
-		 * Since there is some unusable space left, fill them with null string to avoid
-		 * displaying junk characters.
-		 */
-		null_fill = length - total_read;
-		memset(msg, '\0', null_fill);
-
-		if (copy_to_user(buffer + total_read, msg, null_fill)) {
-			kfree(msg);
-			return -EFAULT;
-		}
-
-		total_read += null_fill;
-	}
-
-	if (status == -EFAULT) {
-		total_read = -EFAULT;
-	}
-
-	kfree(msg);
 	return total_read;
 }
 
@@ -4145,15 +2720,6 @@ static struct nf_hook_ops sfe_ipv4_ops_local_out[] __read_mostly = {
 	},
 };
 #endif
-
-/*
- * sfe_ipv4_cancel_delayed_work_sync()
- */
-bool sfe_ipv4_cancel_delayed_work_sync(void)
-{
-	struct sfe_ipv4 *si = &__si;
-	return cancel_delayed_work_sync(&si->sync_dwork);
-}
 
 /*
  * sfe_ipv4_init()

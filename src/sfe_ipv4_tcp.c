@@ -3,7 +3,7 @@
  *	Shortcut forwarding engine - IPv4 TCP implementation
  *
  * Copyright (c) 2013-2016, 2019-2020, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -30,38 +30,6 @@
 #include "sfe_ipv4.h"
 #include "sfe_pppoe.h"
 #include "sfe_vlan.h"
-#include "sfe_trustsec.h"
-
-static uint8_t tso_clear_fixed_id __read_mostly;		/* TSO clear fixed id */
-
-/*
- * sfe_tso_clear_fixed_id_cfg_get()
- *	Get tso clear fixed id value
- */
-uint8_t sfe_tso_clear_fixed_id_cfg_get(void)
-{
-	return tso_clear_fixed_id;
-}
-
-/*
- * sfe_tso_clear_fixed_id_cfg_set()
- *	Set tso clear fixed id value
- */
-int sfe_tso_clear_fixed_id_cfg_set(uint8_t val)
-{
-	if (tso_clear_fixed_id && val) {
-		pr_err("TSO clear fixed id is already enabled\n");
-		return -EINVAL;
-	}
-
-	if (!tso_clear_fixed_id && !val) {
-		pr_err("TSO clear fixed id is already disabled\n");
-		return -EINVAL;
-	}
-
-	tso_clear_fixed_id = val;
-	return 0;
-}
 
 /*
  * sfe_ipv4_process_tcp_option_sack()
@@ -166,9 +134,6 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	bool bridge_flow;
 	bool fast_xmit;
 	netdev_features_t features;
-	u8 ingress_flags = 0;
-	sfe_fls_conn_stats_update_t update_cb;
-	bool vlan_passthrough = false;
 
 	/*
 	 * Is our packet too short to contain a valid TCP header?
@@ -203,9 +168,6 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		cm = sfe_ipv4_find_connection_match_rcu(si, dev, IPPROTO_TCP, src_ip, src_port, dest_ip, dest_port);
 	}
 #else
-	/*
-	 * 5-tuple lookup for TCP flow.
-	 */
 	cm = sfe_ipv4_find_connection_match_rcu(si, dev, IPPROTO_TCP, src_ip, src_port, dest_ip, dest_port);
 #endif
 	if (unlikely(!cm)) {
@@ -250,15 +212,8 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		return 0;
 	}
 
-	if (unlikely(cm->fls_conn && !(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_FLS_DISABLED))){
-		update_cb = rcu_dereference(sfe_fls_info.stats_update_cb);
-		if (likely(update_cb && !update_cb(cm->fls_conn, skb))) {
-			cm->flags |= SFE_IPV4_CONNECTION_MATCH_FLAG_FLS_DISABLED;
-		}
-	}
-
 	/*
-	 * If our packet has been marked as "sync on find" we can't actually
+	 * If our packet has beern marked as "flush on find" we can't actually
 	 * forward it in the fast path, but now that we've found an associated
 	 * connection we need sync its status before throw it slow path.
 	 */
@@ -286,27 +241,10 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	/*
 	 * Do we expect an ingress VLAN tag for this flow?
 	 */
-#ifdef SFE_BRIDGE_VLAN_FILTERING_ENABLE
-	ingress_flags = cm->vlan_filter_rule.ingress_flags;
-#endif
-	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info, ingress_flags))) {
-		if (!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_VLAN_PASSTHROUGH)) {
-			rcu_read_unlock();
-			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
-			DEBUG_TRACE("VLAN tag mismatch. skb=%px\n", skb);
-			return 0;
-		}
-		vlan_passthrough = true;
-		this_cpu_inc(si->stats_pcpu->bridge_vlan_passthorugh_forwarded64);
-	}
-
-	/*
-	 * Do we expect a trustsec header for this flow ?
-	 */
-	if (unlikely(!sfe_trustsec_validate_ingress_sgt(skb, cm->ingress_trustsec_valid, &cm->ingress_trustsec_hdr, l2_info))) {
+	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info))) {
 		rcu_read_unlock();
-		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_INGRESS_TRUSTSEC_SGT_MISMATCH);
-		DEBUG_TRACE("Trustsec SGT mismatch. skb=%px\n", skb);
+		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
+		DEBUG_TRACE("VLAN tag mismatch. skb=%px\n", skb);
 		return 0;
 	}
 
@@ -350,8 +288,8 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		ret = sfe_ipv4_remove_connection(si, c);
 		spin_unlock_bh(&si->lock);
 
-		DEBUG_TRACE("TCP flags: %#x are not fast. %u->%u\n",
-				htonl(flags), htons(src_port), htons(dest_port));
+		DEBUG_TRACE("TCP flags: 0x%x are not fast\n",
+			    flags & (TCP_FLAG_SYN | TCP_FLAG_RST | TCP_FLAG_FIN | TCP_FLAG_ACK));
 		if (ret) {
 			sfe_ipv4_flush_connection(si, c, SFE_SYNC_REASON_FLUSH);
 		}
@@ -541,35 +479,24 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	}
 
 	/*
-	 * Check if skb was cloned. If it was, unclone it. Because
+	 * Check if skb was cloned. If it was, unshare it. Because
 	 * the data area is going to be written in this path and we don't want to
 	 * change the cloned skb's data section.
 	 */
 	if (unlikely(skb_cloned(skb))) {
 		DEBUG_TRACE("%px: skb is a cloned skb\n", skb);
-
-		if (unlikely(skb_shared(skb)) || unlikely(skb_unclone(skb, GFP_ATOMIC))) {
+		skb = skb_unshare(skb, GFP_ATOMIC);
+		if (!skb) {
+			DEBUG_WARN("Failed to unshare the cloned skb\n");
 			rcu_read_unlock();
-			DEBUG_WARN("Failed to unclone the cloned skb\n");
-			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_UNCLONE_FAILED);
 			return 0;
 		}
 
 		/*
-		 * Update the iph and tcph pointers with the uncloned skb's data area.
+		 * Update the iph and tcph pointers with the unshared skb's data area.
 		 */
 		iph = (struct iphdr *)skb->data;
 		tcph = (struct tcphdr *)(skb->data + ihl);
-	}
-
-	/*
-	 * Check if skb has enough headroom to write L2 headers
-	 */
-	if (unlikely(skb_headroom(skb) < cm->l2_hdr_size)) {
-		rcu_read_unlock();
-		DEBUG_WARN("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
-		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_NO_HEADROOM);
-		return 0;
 	}
 
 	/*
@@ -608,7 +535,7 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		 * If packet contains PPPoE header but CME doesn't contain PPPoE flag yet we are exceptioning
 		 * the packet to linux
 		 */
-		if (unlikely(!bridge_flow)) {
+		if (unlikely(!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_FLOW))) {
 			rcu_read_unlock();
 			DEBUG_TRACE("%px: CME doesn't contain PPPoE flag but packet has PPPoE header\n", skb);
 			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME);
@@ -619,19 +546,18 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		 * For bridged flows when packet contains PPPoE header, restore the header back and forward
 		 * to xmit interface
 		 */
-		__skb_push(skb, PPPOE_SES_HLEN);
+		__skb_push(skb, (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr)));
 		this_cpu_inc(si->stats_pcpu->pppoe_bridge_packets_forwarded64);
 	}
 
 	/*
-	 * For bridged flows when packet contains the VLan header, restore the header back and forward
-	 * we do this here, to make sure PPPOE header is restored before VLAN header(s) is restored for pppoe over vlan passthrough use cases
+	 * Check if skb has enough headroom to write L2 headers
 	 */
-	if (unlikely(vlan_passthrough)) {
-		struct ethhdr *eth = eth_hdr(skb);
-		__skb_push(skb, l2_info->vlan_hdr_cnt * VLAN_HLEN);
-		skb_reset_network_header(skb);
-		skb->protocol = eth->h_proto;
+	if (unlikely(skb_headroom(skb) < cm->l2_hdr_size)) {
+		rcu_read_unlock();
+		DEBUG_WARN("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
+		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_NO_HEADROOM);
+		return 0;
 	}
 
 	/*
@@ -639,41 +565,9 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	 */
 
 	/*
-	 * In case of TSO, when DF bit is set in TCP frames in gro path,
-	 * it sets SKB_GSO_TCP_FIXEDID in gso_type but our HW does not
-	 * support fixed ID. Hence, in normal SFE+TSO case it goes through
-	 * GSO instead of TSO. In case of SFE+PPPOE+TSO if fixed id is
-	 * set it can't do TSO as HW doesn't support it and also it can't
-	 * do GSO because GSO currently does not support PPPoE header.
-	 * In both the above cases, if TSO has to be used then clear the
-	 * fixed id from skb gso type and it can be done using sys param.
-	 */
-	if (unlikely(tso_clear_fixed_id)) {
-		skb_shinfo(skb)->gso_type &= ~(SKB_GSO_TCP_FIXEDID);
-	}
-
-	/*
-	 * TSO is not supported for maple. Hence SFE_IPV4_CONNECTION_MATCH_FLAG_TSO_ENABLE will be disabled for maple.
-	 * For SFE + PPPoE flow, GSO is not supported but TSO is supported. If TSO is enabled and if the number of segments is more than 32, flush the rule so that it goes throught host.
 	 * For PPPoE flows, add PPPoE header before L2 header is added.
 	 */
 	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PPPOE_ENCAP)) {
-#if defined(SFE_TSO_MAX_SEG_LIMIT_ENABLE)
-		if (((!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_TSO_ENABLE)) && skb_shinfo(skb)->gso_segs) ||
-			(skb_shinfo(skb)->gso_segs >= SFE_TSO_SEG_MAX) || (skb_shinfo(skb)->gso_type & SKB_GSO_TCP_FIXEDID)) {
-			struct sfe_ipv4_connection *c = cm->connection;
-			spin_lock_bh(&si->lock);
-			ret = sfe_ipv4_remove_connection(si, c);
-			spin_unlock_bh(&si->lock);
-			if (ret) {
-				sfe_ipv4_flush_connection(si, c, SFE_SYNC_REASON_FLUSH);
-			}
-
-			rcu_read_unlock();
-			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_TSO_SEG_MAX_NOT_SUPPORTED);
-			return 0;
-		}
-#endif
 		sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IP);
 		this_cpu_inc(si->stats_pcpu->pppoe_encap_packets_forwarded64);
 	}
@@ -683,13 +577,6 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	 */
 	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_DSCP_REMARK)) {
 		iph->tos = (iph->tos & SFE_IPV4_DSCP_MASK) | cm->dscp;
-	}
-
-	/*
-	 * Set SKB packet type to PACKET_HOST
-	 */
-	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PACKET_HOST)) {
-		skb->pkt_type = PACKET_HOST;
 	}
 
 	/*
@@ -774,13 +661,6 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	skb->dev = xmit_dev;
 
 	/*
-	 * For trustsec flows, add trustsec header before L2 header is added.
-	 */
-	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_TRUSTSEC_SGT)) {
-		sfe_trustsec_add_sgt(skb, &cm->egress_trustsec_hdr);
-	}
-
-	/*
 	 * Check to see if we need to add VLAN tags
 	 */
 	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG)) {
@@ -808,13 +688,10 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	}
 
 	/*
-	 * Update priority and int_pri of skb.
+	 * Update priority of skb.
 	 */
 	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PRIORITY_REMARK)) {
 		skb->priority = cm->priority;
-#if defined(SFE_PPE_QOS_SUPPORTED)
-		skb_set_int_pri(skb, cm->int_pri);
-#endif
 	}
 
 	/*
@@ -826,7 +703,7 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		 * Update service class stats if SAWF is valid.
 		 */
 		if (likely(cm->sawf_valid)) {
-			service_class_id = cm->svc_id;
+			service_class_id = SFE_GET_SAWF_SERVICE_CLASS(cm->mark);
 			sfe_ipv4_service_class_stats_inc(si, service_class_id, len);
 		}
 	}
@@ -845,15 +722,15 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	features = cm->features;
 	fast_xmit = !!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_FAST_XMIT);
 
-	/*
-	 * In the map-t tunnel, it needs correct transport header.
-	 * when l2 acceleration enabled, this header was not ever set.
-	 */
-	skb_set_transport_header(skb, ihl);
-
 	rcu_read_unlock();
 
 	this_cpu_inc(si->stats_pcpu->packets_forwarded64);
+
+	/*
+	 * We're going to check for GSO flags when we transmit the packet so
+	 * start fetching the necessary cache line now.
+	 */
+	prefetch(skb_shinfo(skb));
 
 	/*
 	 * We do per packet condition check before we could fast xmit the
@@ -872,26 +749,13 @@ int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	}
 
 	/*
-	 * We're going to check for GSO flags when we transmit the packet so
-	 * start fetching the necessary cache line now.
-	 */
-	prefetch(skb_shinfo(skb));
-
-	/*
 	 * Mark that this packet has been fast forwarded.
 	 */
 	skb->fast_forwarded = 1;
 
 	/*
-	 * check if fast qdisc xmit is enabled and send the packet on its way.
+	 * Send the packet on its way.
 	 */
-        if (cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_FAST_QDISC_XMIT) {
-		if (likely(dev_fast_xmit_qdisc(skb, xmit_dev, cm->qdisc_xmit_dev))) {
-			this_cpu_inc(si->stats_pcpu->packets_fast_qdisc_xmited64);
-			return 1;
-		}
-	}
-
 	dev_queue_xmit(skb);
 
 	return 1;

@@ -3,7 +3,7 @@
  *	Shortcut forwarding engine file for IPv6 UDP
  *
  * Copyright (c) 2015-2016, 2019-2020, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -31,9 +31,6 @@
 #include "sfe_ipv6.h"
 #include "sfe_pppoe.h"
 #include "sfe_vlan.h"
-#include "sfe_trustsec.h"
-#include "sfe_ipv6_multicast.h"
-#include "sfe_ipv6_frag.h"
 
 /*
  * sfe_ipv6_udp_sk_deliver()
@@ -128,7 +125,7 @@ static int sfe_ipv6_udp_sk_deliver(struct sk_buff *skb, struct sfe_ipv6_connecti
  *	Handle UDP packet receives and forwarding.
  */
 int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_device *dev,
-			     unsigned int len, struct ipv6hdr *iph, unsigned int ihl, bool sync_on_find, struct sfe_l2_info *l2_info, bool tun_outer, bool is_frag, struct frag_hdr * fhdr)
+			     unsigned int len, struct ipv6hdr *iph, unsigned int ihl, bool sync_on_find, struct sfe_l2_info *l2_info, bool tun_outer)
 {
 	struct udphdr *udph;
 	struct sfe_ipv6_addr *src_ip;
@@ -143,18 +140,8 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	bool bridge_flow;
 	bool fast_xmit;
 	netdev_features_t features;
-	u8 ingress_flags = 0;
-	sfe_fls_conn_stats_update_t update_cb;
-	bool vlan_passthrough = false;
 
 	DEBUG_TRACE("%px: sfe: sfe_ipv6_recv_udp called.\n", skb);
-
-	/*
-	 * If fragment handling is enabled, forward the fragments.
-	 */
-	if (si->fragment_forwarding_enable && is_frag) {
-		return sfe_ipv6_recv_udp_frag(si, skb, dev, len, iph, ihl, sync_on_find, l2_info, tun_outer, fhdr);
-	}
 
 	/*
 	 * Is our packet too short to contain a valid UDP header?
@@ -209,27 +196,10 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	/*
 	 * Do we expect an ingress VLAN tag for this flow?
 	 */
-#ifdef SFE_BRIDGE_VLAN_FILTERING_ENABLE
-	ingress_flags = cm->vlan_filter_rule.ingress_flags;
-#endif
-	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info, ingress_flags))) {
-		if (!(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_BRIDGE_VLAN_PASSTHROUGH)) {
-			rcu_read_unlock();
-			sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
-			DEBUG_TRACE("VLAN tag mismatch. skb=%px\n", skb);
-			return 0;
-		}
-		vlan_passthrough = true;
-		this_cpu_inc(si->stats_pcpu->bridge_vlan_passthorugh_forwarded64);
-	}
-
-	/*
-	 * Do we expect a trustsec header for this flow ?
-	 */
-	if (unlikely(!sfe_trustsec_validate_ingress_sgt(skb, cm->ingress_trustsec_valid, &cm->ingress_trustsec_hdr, l2_info))) {
+	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info))) {
 		rcu_read_unlock();
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INGRESS_TRUSTSEC_SGT_MISMATCH);
-		DEBUG_TRACE("Trustsec SGT mismatch. skb=%px\n", skb);
+		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
+		DEBUG_TRACE("VLAN tag mismatch. skb=%px\n", skb);
 		return 0;
 	}
 
@@ -254,19 +224,12 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 		return 0;
 	}
 
-	if (unlikely(cm->fls_conn && !(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_FLS_DISABLED))){
-		update_cb = rcu_dereference(sfe_fls_info.stats_update_cb);
-		if (likely(update_cb && !update_cb(cm->fls_conn, skb))) {
-			cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_FLS_DISABLED;
-		}
-	}
-
 	/*
-	 * If our packet has been marked as "sync on find" we can't actually
+	 * If our packet has been marked as "flush on find" we can't actually
 	 * forward it in the fast path, but now that we've found an associated
 	 * connection we need sync its status before exception it to slow path.
 	 */
-	if (unlikely(sync_on_find || is_frag)) {
+	if (unlikely(sync_on_find)) {
 		sfe_ipv6_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
 		rcu_read_unlock();
 
@@ -307,7 +270,7 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	 * If our packet is larger than the MTU of the transmit interface then
 	 * we can't forward it easily.
 	 */
-	if (unlikely((len > cm->xmit_dev_mtu) && (!cm->up))) {
+	if (unlikely(len > cm->xmit_dev_mtu)) {
 		sfe_ipv6_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
 		rcu_read_unlock();
 
@@ -317,35 +280,24 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	}
 
 	/*
-	 * Check if skb was cloned. If it was, unclone it. Because
+	 * Check if skb was cloned. If it was, unshare it. Because
 	 * the data area is going to be written in this path and we don't want to
 	 * change the cloned skb's data section.
 	 */
 	if (unlikely(skb_cloned(skb))) {
 		DEBUG_TRACE("%px: skb is a cloned skb\n", skb);
-
-		if (unlikely(skb_shared(skb)) || unlikely(skb_unclone(skb, GFP_ATOMIC))) {
+		skb = skb_unshare(skb, GFP_ATOMIC);
+                if (!skb) {
+			DEBUG_WARN("Failed to unshare the cloned skb\n");
 			rcu_read_unlock();
-			DEBUG_WARN("Failed to unclone the cloned skb\n");
-			sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_UNCLONE_FAILED);
 			return 0;
 		}
 
 		/*
-		 * Update the iph and udph pointers with the unclone skb's data area.
+		 * Update the iph and udph pointers with the unshared skb's data area.
 		 */
 		iph = (struct ipv6hdr *)skb->data;
 		udph = (struct udphdr *)(skb->data + ihl);
-	}
-
-	/*
-	 * Check if skb has enough headroom to write L2 headers
-	 */
-	if (unlikely(skb_headroom(skb) < cm->l2_hdr_size)) {
-		rcu_read_unlock();
-		DEBUG_WARN("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_NO_HEADROOM);
-		return 0;
 	}
 
 	/*
@@ -383,29 +335,29 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 		/*
 		 * If packet contains PPPoE header but CME doesn't contain PPPoE flag yet we are exceptioning the packet to linux
 		 */
-		if (unlikely(!bridge_flow)) {
+		if (unlikely(!(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_BRIDGE_FLOW))) {
 			rcu_read_unlock();
 			DEBUG_TRACE("%px: CME doesn't contain PPPoE flag but packet has PPPoE header\n", skb);
 			sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME);
 			return 0;
+
 		}
 
 		/*
 		 * For bridged flows when packet contains PPPoE header, restore the header back and forward to xmit interface
 		 */
-		__skb_push(skb, PPPOE_SES_HLEN);
+		__skb_push(skb, (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr)));
 		this_cpu_inc(si->stats_pcpu->pppoe_bridge_packets_forwarded64);
 	}
 
 	/*
-	 * For bridged flows when packet contains the VLan header, restore the header back and forward
-	 * we do this here, to make sure PPPOE header is restored before VLAN header(s) is restored for pppoe over vlan passthrough use cases
+	 * Check if skb has enough headroom to write L2 headers
 	 */
-	if (unlikely(vlan_passthrough)) {
-		struct ethhdr *eth = eth_hdr(skb);
-		__skb_push(skb, l2_info->vlan_hdr_cnt * VLAN_HLEN);
-		skb_reset_network_header(skb);
-		skb->protocol = eth->h_proto;
+	if (unlikely(skb_headroom(skb) < cm->l2_hdr_size)) {
+		rcu_read_unlock();
+		DEBUG_WARN("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
+		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_NO_HEADROOM);
+		return 0;
 	}
 
 	/*
@@ -413,43 +365,11 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	 */
 
 	/*
-	 * Multicast share the same check with unicast, from this point, they are going to
-	 * divert.
-	 */
-	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_MULTICAST)) {
-		ret = sfe_ipv6_recv_multicast(si, skb, ihl, len, cm, l2_info, tun_outer, true);
-		rcu_read_unlock();
-		return ret;
-	}
-
-	/*
 	 * For PPPoE flows, add PPPoE header before L2 header is added.
-	 * SFE + PPPOE flow is not supported with GSO, hence destroy the connection.
 	 */
 	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP)) {
-		if ((unlikely(skb_shinfo(skb)->gso_segs))) {
-			struct sfe_ipv6_connection *c = cm->connection;
-			spin_lock_bh(&si->lock);
-			ret = sfe_ipv6_remove_connection(si, c);
-			spin_unlock_bh(&si->lock);
-			if (ret) {
-				sfe_ipv6_flush_connection(si, c, SFE_SYNC_REASON_FLUSH);
-			}
-
-			rcu_read_unlock();
-			sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_GSO_NOT_SUPPORTED);
-			return 0;
-		}
-
 		sfe_pppoe_add_header(skb, cm->pppoe_session_id, PPP_IPV6);
 		this_cpu_inc(si->stats_pcpu->pppoe_encap_packets_forwarded64);
-	}
-
-	/*
-	 * Set SKB packet type to PACKET_HOST
-	 */
-	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PACKET_HOST)) {
-		skb->pkt_type = PACKET_HOST;
 	}
 
 	/*
@@ -475,7 +395,7 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 
 		/*
 		 * Update traffic stats
-		*/
+	 	*/
 		atomic_inc(&cm->rx_packet_count);
 		atomic_add(len, &cm->rx_byte_count);
 
@@ -577,13 +497,6 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	skb->dev = xmit_dev;
 
 	/*
-	 * For trustsec flows, add trustsec header before L2 header is added.
-	 */
-	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_INSERT_EGRESS_TRUSTSEC_SGT)) {
-		sfe_trustsec_add_sgt(skb, &cm->egress_trustsec_hdr);
-	}
-
-	/*
 	 * Check to see if we need to add VLAN tags
 	 */
 	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG)) {
@@ -609,13 +522,10 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	}
 
 	/*
-	 * Update priority and int_pri of skb.
+	 * Update priority of skb.
 	 */
 	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PRIORITY_REMARK)) {
 		skb->priority = cm->priority;
-#if defined(SFE_PPE_QOS_SUPPORTED)
-		skb_set_int_pri(skb, cm->int_pri);
-#endif
 	}
 
 	/*
@@ -627,7 +537,7 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 		 * Update service class stats if SAWF is valid.
 		 */
 		if (likely(cm->sawf_valid)) {
-			service_class_id = cm->svc_id;
+			service_class_id = SFE_GET_SAWF_SERVICE_CLASS(cm->mark);
 			sfe_ipv6_service_class_stats_inc(si, service_class_id, len);
 		}
 	}
@@ -652,6 +562,12 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	this_cpu_inc(si->stats_pcpu->packets_forwarded64);
 
 	/*
+	 * We're going to check for GSO flags when we transmit the packet so
+	 * start fetching the necessary cache line now.
+	 */
+	prefetch(skb_shinfo(skb));
+
+	/*
 	 * We do per packet condition check before we could fast xmit the
 	 * packet.
 	 */
@@ -661,26 +577,13 @@ int sfe_ipv6_recv_udp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	}
 
 	/*
-	 * We're going to check for GSO flags when we transmit the packet so
-	 * start fetching the necessary cache line now.
-	 */
-	prefetch(skb_shinfo(skb));
-
-	/*
 	 * Mark that this packet has been fast forwarded.
 	 */
 	skb->fast_forwarded = 1;
 
 	/*
-	 * check if fast qdisc xmit is enabled and send the packet on its way.
+	 * Send the packet on its way.
 	 */
-	if (cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_FAST_QDISC_XMIT) {
-		if (likely(dev_fast_xmit_qdisc(skb, xmit_dev, cm->qdisc_xmit_dev))) {
-			this_cpu_inc(si->stats_pcpu->packets_fast_qdisc_xmited64);
-			return 1;
-		}
-	}
-
 	dev_queue_xmit(skb);
 
 	return 1;

@@ -2,7 +2,7 @@
  * sfe_ipv4_tun6rd.c
  *	Shortcut forwarding engine file for IPv4 TUN6RD
  *
- * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -29,7 +29,6 @@
 #include "sfe_flow_cookie.h"
 #include "sfe_ipv4.h"
 #include "sfe_vlan.h"
-#include "sfe_trustsec.h"
 
 /*
  * sfe_ipv4_recv_tun6rd()
@@ -43,7 +42,6 @@ int sfe_ipv4_recv_tun6rd(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_de
 	__be32 dest_ip;
 	__be16 src_port = 0;
 	__be16 dest_port = 0;
-	bool hw_csum;
 	struct sfe_ipv4_connection_match *cm;
 
 	DEBUG_TRACE("%px: sfe: sfe_ipv4_recv_tun6rd called.\n", skb);
@@ -89,21 +87,6 @@ int sfe_ipv4_recv_tun6rd(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_de
 	}
 
 	/*
-	 * In the passthrough case, the packet needs to decrement ttl.
-	 */
-	if (cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PASSTHROUGH) {
-		if (iph->ttl < 2) {
-			sfe_ipv4_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
-			rcu_read_unlock();
-
-			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_TUN6RD_SMALL_TTL);
-			DEBUG_TRACE("%px: ttl too low\n", skb);
-			return 0;
-		}
-		iph->ttl--;
-	}
-
-	/*
 	 * If cm->proto is set, it means the decap path.
 	 * Otherwise we forward the packet in encap path.
 	 */
@@ -120,7 +103,7 @@ int sfe_ipv4_recv_tun6rd(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_de
 		 * Here, no modification is needed, we only check tag match between
 		 * vlan hdr stored in cm and l2_info.
 		 */
-		if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info, 0))) {
+		if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info))) {
 			rcu_read_unlock();
 			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
 			DEBUG_TRACE("VLAN tag mismatch. skb=%px\n"
@@ -134,17 +117,6 @@ int sfe_ipv4_recv_tun6rd(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_de
 				htons(l2_info->vlan_hdr[1].tpid), l2_info->vlan_hdr[1].tci);
 			return 0;
 		}
-
-		/*
-		 * Do we expect a trustsec header for this flow ?
-		 */
-		if (unlikely(!sfe_trustsec_validate_ingress_sgt(skb, cm->ingress_trustsec_valid, &cm->ingress_trustsec_hdr, l2_info))) {
-			rcu_read_unlock();
-			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_INGRESS_TRUSTSEC_SGT_MISMATCH);
-			DEBUG_TRACE("Trustsec SGT mismatch. skb=%px\n", skb);
-			return 0;
-		}
-
 		skb_reset_network_header(skb);
 		skb_pull(skb, ihl);
 		skb_reset_transport_header(skb);
@@ -190,38 +162,12 @@ int sfe_ipv4_recv_tun6rd(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_de
 	}
 
 	/*
-	 * If HW checksum offload is not possible, full L3 checksum and incremental L4 checksum
-	 * are used to update the packet. Setting ip_summed to CHECKSUM_UNNECESSARY ensures checksum is
-	 * not recalculated further in packet path.
-	 */
-	hw_csum = !!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD) && (skb->ip_summed == CHECKSUM_UNNECESSARY);
-	if (likely(hw_csum)) {
-		skb->ip_summed = CHECKSUM_PARTIAL;
-	} else {
-		iph->check = sfe_ipv4_gen_ip_csum(iph);
-	}
-
-	/*
-	 * Set SKB packet type to PACKET_HOST
-	 */
-	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PACKET_HOST)) {
-		skb->pkt_type = PACKET_HOST;
-	}
-
-	/*
 	 * Update traffic stats.
 	 */
 	atomic_inc(&cm->rx_packet_count);
 	atomic_add(len, &cm->rx_byte_count);
 
 	skb->dev = cm->xmit_dev;
-
-	/*
-	 * For trustsec flows, add trustsec header before L2 header is added.
-	 */
-	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_TRUSTSEC_SGT)) {
-		sfe_trustsec_add_sgt(skb, &cm->egress_trustsec_hdr);
-	}
 
 	/*
 	 * Check to see if we need to add VLAN tags
