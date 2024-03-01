@@ -2,7 +2,7 @@
  * sfe_ipv6_pppoe_br.c
  *	Shortcut forwarding engine - IPv6 PPPoE bridge implementation
  *
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -28,6 +28,7 @@
 #include "sfe_ipv6.h"
 #include "sfe_pppoe.h"
 #include "sfe_vlan.h"
+#include "sfe_trustsec.h"
 
 /*
  * sfe_ipv6_recv_pppoe_bridge()
@@ -81,10 +82,20 @@ int sfe_ipv6_recv_pppoe_bridge(struct sfe_ipv6 *si, struct sk_buff *skb, struct 
 	/*
 	 * Do we expect an ingress VLAN tag for this flow?
 	 */
-	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info))) {
+	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info, 0))) {
 		rcu_read_unlock();
 		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
 		DEBUG_TRACE("VLAN tag mismatch. skb=%px\n", skb);
+		return 0;
+	}
+
+	/*
+	 * Do we expect a trustsec header for this flow ?
+	 */
+	if (unlikely(!sfe_trustsec_validate_ingress_sgt(skb, cm->ingress_trustsec_valid, &cm->ingress_trustsec_hdr, l2_info))) {
+		rcu_read_unlock();
+		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INGRESS_TRUSTSEC_SGT_MISMATCH);
+		DEBUG_TRACE("Trustsec SGT mismatch. skb=%px\n", skb);
 		return 0;
 	}
 
@@ -96,6 +107,13 @@ int sfe_ipv6_recv_pppoe_bridge(struct sfe_ipv6 *si, struct sk_buff *skb, struct 
 		DEBUG_WARN("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
 		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_NO_HEADROOM);
 		return 0;
+	}
+
+	/*
+	 * Set SKB packet type to PACKET_HOST
+	 */
+	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PACKET_HOST)) {
+		skb->pkt_type = PACKET_HOST;
 	}
 
 	/*
@@ -111,6 +129,13 @@ int sfe_ipv6_recv_pppoe_bridge(struct sfe_ipv6 *si, struct sk_buff *skb, struct 
 
 	xmit_dev = cm->xmit_dev;
 	skb->dev = xmit_dev;
+
+	/*
+	 * For trustsec flows, add trustsec header before L2 header is added.
+	 */
+	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_INSERT_EGRESS_TRUSTSEC_SGT)) {
+		sfe_trustsec_add_sgt(skb, &cm->egress_trustsec_hdr);
+	}
 
 	/*
 	 * Check to see if we need to add VLAN tags
@@ -138,10 +163,13 @@ int sfe_ipv6_recv_pppoe_bridge(struct sfe_ipv6 *si, struct sk_buff *skb, struct 
 	}
 
 	/*
-	 * Update priority of skb.
+	 * Update priority and int_pri of skb.
 	 */
 	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PRIORITY_REMARK)) {
 		skb->priority = cm->priority;
+#if defined(SFE_PPE_QOS_SUPPORTED)
+		skb_set_int_pri(skb, cm->int_pri);
+#endif
 	}
 
 	/*
@@ -153,7 +181,7 @@ int sfe_ipv6_recv_pppoe_bridge(struct sfe_ipv6 *si, struct sk_buff *skb, struct 
 		 * Update service class stats if SAWF is valid.
 		 */
 		if (likely(cm->sawf_valid)) {
-			service_class_id = SFE_GET_SAWF_SERVICE_CLASS(cm->mark);
+			service_class_id = cm->svc_id;
 			sfe_ipv6_service_class_stats_inc(si, service_class_id, len);
 		}
 	}

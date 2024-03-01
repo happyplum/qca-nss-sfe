@@ -1,8 +1,8 @@
 /*
- * sfe_ipv4_gre.c
- *	Shortcut forwarding engine file for IPv4 GRE
+ * sfe_ipv4_l2tpv3.c
+ *	Shortcut forwarding engine file for IPv4 L2TPv3
  *
- * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -22,9 +22,6 @@
 #include <linux/etherdevice.h>
 #include <linux/lockdep.h>
 #include <net/ip.h>
-#include <net/gre.h>
-#include <net/pptp.h>
-
 #include "sfe_debug.h"
 #include "sfe_api.h"
 #include "sfe.h"
@@ -35,16 +32,14 @@
 #include "sfe_trustsec.h"
 
 /*
- * sfe_ipv4_recv_gre()
- *	GRE tunnel packet receive and forwarding.
+ * sfe_ipv4_recv_l2tpv3()
+ *	l2tpv3 tunnel packet receive and forwarding.
  */
-int sfe_ipv4_recv_gre(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_device *dev,
+int sfe_ipv4_recv_l2tpv3(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_device *dev,
 		      unsigned int len, struct iphdr *iph, unsigned int ihl, bool sync_on_find,
 		      struct sfe_l2_info *l2_info, bool tun_outer)
 {
 	struct sfe_ipv4_connection_match *cm;
-	struct pptp_gre_header *pptp_hdr;
-	struct gre_base_hdr *gre_hdr;
 	struct net_device *xmit_dev;
 	__be16 dest_port = 0;
 	bool passthrough;
@@ -56,16 +51,6 @@ int sfe_ipv4_recv_gre(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	u8 ttl;
 
 	/*
-	 * Is our packet too short to contain a valid GRE header?
-	 */
-	if (unlikely(!pskb_may_pull(skb, sizeof(*gre_hdr) + ihl))) {
-		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_GRE_HEADER_INCOMPLETE);
-		DEBUG_TRACE("packet too short for GRE header\n");
-		return 0;
-	}
-
-
-	/*
 	 * Read the source and destination IP address.
 	 */
 	src_ip = iph->saddr;
@@ -73,29 +58,19 @@ int sfe_ipv4_recv_gre(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 
 	rcu_read_lock();
 
-	/*
-	 * Look for a connection match with 4 tuple if it is PPTP
-	 */
-	gre_hdr = (struct gre_base_hdr *)(skb->data + ihl);
-
-	if ((gre_hdr->protocol == GRE_PROTO_PPP) && likely(pskb_may_pull(skb, (sizeof(*pptp_hdr) - 8) + ihl))) {
-		pptp_hdr = (struct pptp_gre_header *)(skb->data + ihl);
-		dest_port = pptp_hdr->call_id;
-	}
-
 #ifdef CONFIG_NF_FLOW_COOKIE
 	cm = si->sfe_flow_cookie_table[skb->flow_cookie & SFE_FLOW_COOKIE_MASK].match;
 	if (unlikely(!cm)) {
-		cm = sfe_ipv4_find_connection_match_rcu(si, dev, IPPROTO_GRE, src_ip, 0, dest_ip, dest_port);
+		cm = sfe_ipv4_find_connection_match_rcu(si, dev, IPPROTO_L2TP, src_ip, 0, dest_ip, dest_port);
 	}
 #else
-	cm = sfe_ipv4_find_connection_match_rcu(si, dev, IPPROTO_GRE, src_ip, 0, dest_ip, dest_port);
+	cm = sfe_ipv4_find_connection_match_rcu(si, dev, IPPROTO_L2TP, src_ip, 0, dest_ip, dest_port);
 #endif
 
 	if (unlikely(!cm)) {
 		rcu_read_unlock();
-		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_GRE_NO_CONNECTION);
-		DEBUG_INFO("no GRE connection match found dev %s src ip %pI4 dest ip %pI4 port %d\n", dev->name, &src_ip, &dest_ip, ntohs(dest_port));
+		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_L2TPV3_NO_CONNECTION);
+		DEBUG_TRACE("no L2TPv3 connection match found dev %s src ip %pI4 dest ip %pI4 port %d\n", dev->name, &src_ip, &dest_ip, ntohs(dest_port));
 		return 0;
 	}
 
@@ -132,32 +107,9 @@ int sfe_ipv4_recv_gre(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	 * TODO: revisit to ensure that pass through traffic is not bypassing firewall for fragmented cases
 	 */
 	if (unlikely(sync_on_find) && !passthrough) {
-		/*
-		 * if we put IP fragmented packets in slow path and non IP fragmented packet in fastpath,
-		 * this causes out of order pptp sequence number being received at pptp_rcv_core(). So we need to
-		 * flush the rule for the tunnel which has sequence number to avoid out of order sequence number.
-		 */
-		if ((gre_hdr->protocol == GRE_PROTO_PPP) && (ntohs(iph->frag_off) & IP_MF)) {
-			struct sfe_ipv4_connection *c = cm->connection;
-			int ret;
-
-			spin_lock_bh(&si->lock);
-			ret = sfe_ipv4_remove_connection(si, c);
-			spin_unlock_bh(&si->lock);
-
-			if (ret) {
-				sfe_ipv4_flush_connection(si, c, SFE_SYNC_REASON_FLUSH);
-			}
-
-			rcu_read_unlock();
-			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_GRE_IP_OPTIONS_OR_INITIAL_FRAGMENT);
-			DEBUG_TRACE("%px: sfe: pptp cm flushed\n", cm);
-			return 0;
-		}
-
 		sfe_ipv4_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
 		rcu_read_unlock();
-		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_GRE_IP_OPTIONS_OR_INITIAL_FRAGMENT);
+		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_L2TPV3_IP_OPTIONS_OR_INITIAL_FRAGMENT);
 		DEBUG_TRACE("%px: sfe: sync on find\n", cm);
 		return 0;
 	}
@@ -193,7 +145,7 @@ int sfe_ipv4_recv_gre(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		rcu_read_unlock();
 
 		DEBUG_TRACE("%px: sfe: TTL too low\n", skb);
-		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_GRE_SMALL_TTL);
+		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_L2TPV3_SMALL_TTL);
 		return 0;
 	}
 
@@ -239,7 +191,7 @@ int sfe_ipv4_recv_gre(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		eth = eth_hdr(skb);
 
 		pppoe_match = (cm->pppoe_session_id == sfe_l2_pppoe_session_id_get(l2_info)) &&
-				ether_addr_equal((u8*)cm->pppoe_remote_mac, (u8 *)eth->h_source);
+				ether_addr_equal((u8 *)cm->pppoe_remote_mac, (u8 *)eth->h_source);
 
 		if (unlikely(!pppoe_match)) {
 			DEBUG_TRACE("%px: PPPoE session ID %d and %d or MAC %pM and %pM did not match\n",
@@ -289,7 +241,7 @@ int sfe_ipv4_recv_gre(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		if (ret) {
 			this_cpu_inc(si->stats_pcpu->packets_not_forwarded64);
 			rcu_read_unlock();
-			DEBUG_TRACE("GRE handler returned error %u\n", ret);
+			DEBUG_TRACE("L2TPv3 handler returned error %u\n", ret);
 			return 1;
 		}
 
@@ -321,7 +273,7 @@ int sfe_ipv4_recv_gre(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	if (unlikely(len > cm->xmit_dev_mtu)) {
 		sfe_ipv4_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
 		rcu_read_unlock();
-		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_GRE_NEEDS_FRAGMENTATION);
+		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_L2TPV3_NEEDS_FRAGMENTATION);
 		DEBUG_TRACE("%px: sfe: larger than MTU\n", cm);
 		return 0;
 	}

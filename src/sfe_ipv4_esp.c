@@ -2,7 +2,7 @@
  * sfe_ipv4_esp.c
  *	Shortcut forwarding engine - IPv4 ESP implementation
  *
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -30,6 +30,7 @@
 #include "sfe_ipv4.h"
 #include "sfe_ipv4_esp.h"
 #include "sfe_vlan.h"
+#include "sfe_trustsec.h"
 
 /*
  * sfe_ipv4_recv_esp()
@@ -118,7 +119,7 @@ int sfe_ipv4_recv_esp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	/*
 	 * Do we expect an ingress VLAN tag for this flow?
 	 */
-	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info))) {
+	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info, 0))) {
 		rcu_read_unlock();
 		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
 		DEBUG_TRACE("VLAN tag mismatch. skb=%px\n", skb);
@@ -126,19 +127,30 @@ int sfe_ipv4_recv_esp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	}
 
 	/*
-	 * Check if skb was cloned. If it was, unshare it.
+	 * Do we expect a trustsec header for this flow ?
+	 */
+	if (unlikely(!sfe_trustsec_validate_ingress_sgt(skb, cm->ingress_trustsec_valid, &cm->ingress_trustsec_hdr, l2_info))) {
+		rcu_read_unlock();
+		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_INGRESS_TRUSTSEC_SGT_MISMATCH);
+		DEBUG_TRACE("Trustsec SGT mismatch. skb=%px\n", skb);
+		return 0;
+	}
+
+	/*
+	 * Check if skb was cloned. If it was, unclone it.
 	 */
 	if (unlikely(skb_cloned(skb))) {
 		DEBUG_TRACE("%px: skb is a cloned skb\n", skb);
-		skb = skb_unshare(skb, GFP_ATOMIC);
-		if (!skb) {
-			DEBUG_WARN("Failed to unshare the cloned skb\n");
+
+		if (unlikely(skb_shared(skb)) || unlikely(skb_unclone(skb, GFP_ATOMIC))) {
 			rcu_read_unlock();
+			DEBUG_WARN("Failed to unclone the cloned skb\n");
+			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_UNCLONE_FAILED);
 			return 0;
 		}
 
 		/*
-		 * Update the iphdr pointer with the unshared skb's data area.
+		 * Update the iphdr pointer with the uncloned skb's data area.
 		 */
 		iph = (struct iphdr *)skb->data;
 	}
@@ -218,6 +230,13 @@ int sfe_ipv4_recv_esp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	}
 
 	/*
+	 * Set SKB packet type to PACKET_HOST
+	 */
+	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PACKET_HOST)) {
+		skb->pkt_type = PACKET_HOST;
+	}
+
+	/*
 	 * decrement TTL by 1.
 	 */
 	iph->ttl = (ttl - (u8)(!bridge_flow && !tun_outer));
@@ -259,23 +278,27 @@ int sfe_ipv4_recv_esp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	 */
 	if (likely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_L2_HDR)) {
 		if (unlikely(!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_WRITE_FAST_ETH_HDR))) {
-			dev_hard_header(skb, xmit_dev, ETH_P_IP, cm->xmit_dest_mac, cm->xmit_src_mac, len);
+			dev_hard_header(skb, xmit_dev, ntohs(skb->protocol),
+					cm->xmit_dest_mac, cm->xmit_src_mac, len);
 		} else {
 			/*
 			 * For the simple case we write this really fast.
 			 */
 			struct ethhdr *eth = (struct ethhdr *)__skb_push(skb, ETH_HLEN);
-			eth->h_proto = htons(ETH_P_IP);
+			eth->h_proto = skb->protocol;
 			ether_addr_copy((u8 *)eth->h_dest, (u8 *)cm->xmit_dest_mac);
 			ether_addr_copy((u8 *)eth->h_source, (u8 *)cm->xmit_src_mac);
 		}
 	}
 
 	/*
-	 * Update priority of skb
+	 * Update priority and int_pri of skb
 	 */
 	if (unlikely(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_PRIORITY_REMARK)) {
 		skb->priority = cm->priority;
+#if defined(SFE_PPE_QOS_SUPPORTED)
+		skb_set_int_pri(skb, cm->int_pri);
+#endif
 	}
 
 	/*

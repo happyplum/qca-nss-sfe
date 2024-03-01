@@ -1,8 +1,8 @@
 /*
- * sfe_ipv6_esp.c
- *	Shortcut forwarding engine - IPv6 ESP implementation
+ * sfe_ipv6_etherip.c
+ *	Shortcut forwarding engine file for IPv6 Etherip support
  *
- * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -28,17 +28,15 @@
 #include "sfe.h"
 #include "sfe_flow_cookie.h"
 #include "sfe_ipv6.h"
-#include "sfe_ipv6_esp.h"
-#include "sfe_vlan.h"
-#include "sfe_trustsec.h"
+#include "sfe_ipv6_etherip.h"
 
 /*
- * sfe_ipv6_recv_esp()
- *	Handle ESP packet receives and forwarding
+ * sfe_ipv6_recv_etherip()
+ *	Handle Etherip packet receives and forwarding.
  */
-int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_device *dev,
-		unsigned int len, struct ipv6hdr *iph, unsigned int ihl, bool sync_on_find,
-		struct sfe_l2_info *l2_info, bool tun_outer)
+int sfe_ipv6_recv_etherip(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_device *dev,
+			unsigned int len, struct ipv6hdr *iph, unsigned int ihl, bool sync_on_find,
+			struct sfe_l2_info *l2_info, bool tun_outer)
 {
 	struct sfe_ipv6_connection_match *cm;
 	struct sfe_ipv6_addr *src_ip;
@@ -64,16 +62,16 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 #ifdef CONFIG_NF_FLOW_COOKIE
 	cm = si->sfe_flow_cookie_table[skb->flow_cookie & SFE_FLOW_COOKIE_MASK].match;
 	if (unlikely(!cm)) {
-		cm = sfe_ipv6_find_connection_match_rcu(si, dev, IPPROTO_ESP, src_ip, 0, dest_ip, 0);
+		cm = sfe_ipv6_find_connection_match_rcu(si, dev, IPPROTO_ETHERIP, src_ip, 0, dest_ip, 0);
 	}
 #else
-	cm = sfe_ipv6_find_connection_match_rcu(si, dev, IPPROTO_ESP, src_ip, 0, dest_ip, 0);
+	cm = sfe_ipv6_find_connection_match_rcu(si, dev, IPPROTO_ETHERIP, src_ip, 0, dest_ip, 0);
 #endif
 	if (unlikely(!cm)) {
-		rcu_read_unlock();
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_ESP_NO_CONNECTION);
 
-		DEBUG_TRACE("no connection found for esp packet\n");
+		rcu_read_unlock();
+		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_ETHERIP_NO_CONNECTION);
+		DEBUG_TRACE("no connection found for etherip packet\n");
 		return 0;
 	}
 
@@ -91,6 +89,7 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 		if (ret) {
 			sfe_ipv6_flush_connection(si, c, SFE_SYNC_REASON_FLUSH);
 		}
+
 		rcu_read_unlock();
 		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INVALID_SRC_IFACE);
 		DEBUG_TRACE("flush on wrong source interface check failure\n");
@@ -109,30 +108,10 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	 */
 	if (unlikely(sync_on_find) && !passthrough) {
 		sfe_ipv6_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
-		rcu_read_unlock();
 
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_ESP_IP_OPTIONS_OR_INITIAL_FRAGMENT);
+		rcu_read_unlock();
+		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_ETHERIP_IP_OPTIONS_OR_INITIAL_FRAGMENT);
 		DEBUG_TRACE("Sync on find\n");
-		return 0;
-	}
-
-	/*
-	 * Do we expect an ingress VLAN tag for this flow?
-	 */
-	if (unlikely(!sfe_vlan_validate_ingress_tag(skb, cm->ingress_vlan_hdr_cnt, cm->ingress_vlan_hdr, l2_info, 0))) {
-		rcu_read_unlock();
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INGRESS_VLAN_TAG_MISMATCH);
-		DEBUG_TRACE("VLAN tag mismatch. skb=%px\n", skb);
-		return 0;
-	}
-
-	/*
-	 * Do we expect a trustsec header for this flow ?
-	 */
-	if (unlikely(!sfe_trustsec_validate_ingress_sgt(skb, cm->ingress_trustsec_valid, &cm->ingress_trustsec_hdr, l2_info))) {
-		rcu_read_unlock();
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_INGRESS_TRUSTSEC_SGT_MISMATCH);
-		DEBUG_TRACE("Trustsec SGT mismatch. skb=%px\n", skb);
 		return 0;
 	}
 
@@ -143,6 +122,7 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 		DEBUG_TRACE("%px: skb is a cloned skb\n", skb);
 
 		if (unlikely(skb_shared(skb)) || unlikely(skb_unclone(skb, GFP_ATOMIC))) {
+
 			rcu_read_unlock();
 			DEBUG_WARN("Failed to unclone the cloned skb\n");
 			sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_UNCLONE_FAILED);
@@ -169,11 +149,18 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 
 		ret = ipprot->handler(skb);
 		if (ret) {
+
 			rcu_read_unlock();
 			this_cpu_inc(si->stats_pcpu->packets_not_forwarded64);
-			DEBUG_TRACE("ESP handler returned error %u\n", ret);
+			DEBUG_TRACE("Etherip handler returned error %u\n", ret);
 			return 0;
 		}
+
+		/*
+		 * Update traffic stats.
+		 */
+		atomic_inc(&cm->rx_packet_count);
+		atomic_add(len, &cm->rx_byte_count);
 
 		rcu_read_unlock();
 		this_cpu_inc(si->stats_pcpu->packets_forwarded64);
@@ -181,7 +168,7 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	}
 
 	/*
-	 * esp passthrough / ip local out scenarios
+	 * Etherip passthrough / ip local out scenarios
 	 */
 	/*
 	 * If our packet is larger than the MTU of the transmit interface then
@@ -189,9 +176,9 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	 */
 	if (unlikely(len > cm->xmit_dev_mtu)) {
 		sfe_ipv6_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
-		rcu_read_unlock();
 
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_ESP_NEEDS_FRAGMENTATION);
+		rcu_read_unlock();
+		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_ETHERIP_NEEDS_FRAGMENTATION);
 		DEBUG_TRACE("Larger than MTU\n");
 		return 0;
 	}
@@ -200,6 +187,7 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	 * Check if skb has enough headroom to write L2 headers
 	 */
 	if (unlikely(skb_headroom(skb) < cm->l2_hdr_size)) {
+
 		rcu_read_unlock();
 		DEBUG_TRACE("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
 		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_NO_HEADROOM);
@@ -218,9 +206,9 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	 */
 	if (!bridge_flow && (iph->hop_limit < 2) && passthrough) {
 		sfe_ipv6_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
-		rcu_read_unlock();
 
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_ESP_SMALL_TTL);
+		rcu_read_unlock();
+		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_ETHERIP_SMALL_TTL);
 		DEBUG_TRACE("hop_limit too low\n");
 		return 0;
 	}
@@ -247,19 +235,12 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	skb->dev = xmit_dev;
 
 	/*
-	 * Check to see if we need to add VLAN tags
-	 */
-	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_INSERT_EGRESS_VLAN_TAG)) {
-		sfe_vlan_add_tag(skb, cm->egress_vlan_hdr_cnt, cm->egress_vlan_hdr);
-	}
-
-	/*
 	 * write the layer - 2 header.
 	 */
-	if (likely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_WRITE_L2_HDR)) {
+	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_WRITE_L2_HDR)) {
 		if (unlikely(!(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_WRITE_FAST_ETH_HDR))) {
 			dev_hard_header(skb, xmit_dev, ntohs(skb->protocol),
-					cm->xmit_dest_mac, cm->xmit_src_mac, len);
+			cm->xmit_dest_mac, cm->xmit_src_mac, len);
 		} else {
 			/*
 			 * For the simple case we write this really fast.
@@ -272,19 +253,16 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	}
 
 	/*
-	 * Update priority and int_pri of skb.
+	 * Update priority of skb.
 	 */
 	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PRIORITY_REMARK)) {
 		skb->priority = cm->priority;
-#if defined(SFE_PPE_QOS_SUPPORTED)
-		skb_set_int_pri(skb, cm->int_pri);
-#endif
 	}
 
 	/*
 	 * Mark outgoing packet.
 	 */
-	if (unlikely(cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_MARK)) {
+	if (cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_MARK) {
 		skb->mark = cm->mark;
 	}
 
@@ -297,6 +275,7 @@ int sfe_ipv6_recv_esp(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 		if (likely(sfe_fast_xmit_check(skb, cm->features))) {
 			cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_FAST_XMIT;
 		}
+
 		cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_FAST_XMIT_FLOW_CHECKED;
 	}
 

@@ -3,7 +3,7 @@
  *	Shortcut forwarding engine header file for IPv4.
  *
  * Copyright (c) 2013-2016, 2019-2020, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -26,23 +26,6 @@
 #include <linux/version.h>
 
 /*
- * By default Linux IP header and transport layer header structures are
- * unpacked, assuming that such headers should be 32-bit aligned.
- * Unfortunately some wireless adaptors can't cope with this requirement and
- * some CPUs can't handle misaligned accesses.  For those platforms we
- * define SFE_IPV4_UNALIGNED_IP_HEADER and mark the structures as packed.
- * When we do this the compiler will generate slightly worse code than for the
- * aligned case (on most platforms) but will be much quicker than fixing
- * things up in an unaligned trap handler.
- */
-#define SFE_IPV4_UNALIGNED_IP_HEADER 1
-#if SFE_IPV4_UNALIGNED_IP_HEADER
-#define SFE_IPV4_UNALIGNED_STRUCT __attribute__((packed))
-#else
-#define SFE_IPV4_UNALIGNED_STRUCT
-#endif
-
-/*
  * Specifies the lower bound on ACK numbers carried in the TCP header
  */
 #define SFE_IPV4_TCP_MAX_ACK_WINDOW 65520
@@ -57,6 +40,16 @@ struct sfe_ipv4_tcp_connection_match {
 	u32 max_end;		/* Sequence number of the last byte to ack */
 };
 
+#ifdef SFE_BRIDGE_VLAN_FILTERING_ENABLE
+/*
+ * Bridge VLAN Filter connection match rule structure.
+ */
+struct sfe_ipv4_vlan_filter_connection_match {
+	u32 ingress_vlan_tag;	/**< VLAN tag for ingress packets. */
+	u8 ingress_flags;	/**< VLAN flags at ingress. */
+	u8 reserved[3];		/**< reserved. */
+};
+#endif
 
 /*
  * Bit flags for IPv4 connection matching entry.
@@ -99,6 +92,49 @@ struct sfe_ipv4_tcp_connection_match {
 					/* Fast xmit may be possible for this flow, if SFE check passes */
 #define SFE_IPV4_CONNECTION_MATCH_FLAG_SRC_INTERFACE_CHECK_NO_FLUSH (1<<18)
 					/* Source interface check but do not flush the connection */
+#define SFE_IPV4_CONNECTION_MATCH_FLAG_INSERT_EGRESS_TRUSTSEC_SGT (1<<19)
+					/* Insert Trustsec SGT */
+#define SFE_IPV4_CONNECTION_MATCH_FLAG_FAST_QDISC_XMIT (1<<20)
+					/* Fast Qdisc transmit enabled */
+#define SFE_IPV4_CONNECTION_MATCH_FLAG_MULTICAST (1<<21)
+					/* Multicast flow*/
+#define SFE_IPV4_CONNECTION_MATCH_FLAG_MULTICAST_CHANGED (1<<22)
+					/* Multicast flow changed the data */
+#define SFE_IPV4_CONNECTION_MATCH_FLAG_TSO_ENABLE (1<<23)
+					/* TSO enabled for dest dev */
+#define SFE_IPV4_CONNECTION_MATCH_FLAG_PACKET_HOST (1<<24)
+					/* Packet Host Type Set */
+#define SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_VLAN_PASSTHROUGH (1<<25)
+					/* Bridge Vlan passthrough enable */
+#define SFE_IPV4_CONNECTION_MATCH_FLAG_FLS_DISABLED (1<<26)
+					/* Don't send packets to FLS */
+
+/*
+ * IPv4 multicast destination structure
+ */
+struct sfe_ipv4_mc_dest {
+	struct list_head list;		/* Link in the list*/
+	struct rcu_head rcu;            /* delay rcu free */
+	uint32_t flags;				/* Bit flags associated with the rule */
+	u16 xmit_dest_mac[ETH_ALEN / 2];	/* Destination MAC address to use when forwarding */
+	u16 xmit_src_mac[ETH_ALEN / 2];		/* Src MAC address to use when forwarding */
+	struct net_device *xmit_dev;		/* Transmit interface */
+	netdev_features_t features;		/* Device features */
+
+	uint32_t xlate_src_ip;			/* Translated flow IP address */
+	uint32_t xlate_src_ident;		/* Translated flow ident (e.g. port) */
+	uint32_t xlate_src_csum_adjustment;	/* Transport layer checksum adjustment after source translation */
+	u16 xlate_src_partial_csum_adjustment;	/* Increase compute checksum adjustment */
+	u16 l2_hdr_size;			/* l2 hdr length */
+
+	uint16_t if_mac[3];			/* Interface MAC address */
+	u16 pppoe_session_id;			/* PPPOE header session id */
+	u8 pppoe_remote_mac[ETH_ALEN];		/* PPPOE remote mac address */
+	u8 egress_vlan_hdr_cnt;			/* Active egress vlan headers count */
+	u8 reserved[1];				/* Reserved for alignment */
+	struct sfe_vlan_hdr egress_vlan_hdr[SFE_MAX_VLAN_DEPTH];
+						/* VLAN Tag stack for the egress packets */
+};
 
 /*
  * IPv4 connection matching structure.
@@ -123,6 +159,8 @@ struct sfe_ipv4_connection_match {
 	u16 xmit_src_mac[ETH_ALEN / 2];
 					/* Source MAC address to use when forwarding */
 	struct net_device *xmit_dev;	/* Network device on which to transmit */
+	struct net_device *qdisc_xmit_dev;      /* Interface used for fast qdisc xmit */
+
 	/*
 	 * xmit device's feature
 	 */
@@ -147,21 +185,6 @@ struct sfe_ipv4_connection_match {
 
 	struct net_device *match_dev;	/* Network device */
 
-#ifdef CONFIG_NETFILTER_CP_FLOWSTATS
-	u32 cp_fs_original;     /* Flag indicating if this is original */
-	u32 last_seq_num;     /* Sequence number saved*/
-	u32 last_seq_time;
-	u32 tot_delta;        /* added samples of latency
-				to compute average*/
-	u32 tot_delta_square; /* sum of squares of delta;
-				to calculate std deviation.*/
-	u32 num_samples;
-/*
- * Stats used for Latency flowstats.
- */
-	atomic64_t fs_rx_packet_count;
-	atomic64_t fs_rx_byte_count;
-#endif //CONFIG_NETFILTER_CP_FLOWSTATS
 	/*
 	 * Control the operations of the match.
 	 */
@@ -197,6 +220,19 @@ struct sfe_ipv4_connection_match {
 	struct sfe_vlan_hdr ingress_vlan_hdr[SFE_MAX_VLAN_DEPTH];
 	struct sfe_vlan_hdr egress_vlan_hdr[SFE_MAX_VLAN_DEPTH];
 
+#ifdef SFE_BRIDGE_VLAN_FILTERING_ENABLE
+	/*
+	 * Bridge VLAN Filter information per connection match entry.
+	 */
+	struct sfe_ipv4_vlan_filter_connection_match vlan_filter_rule;
+#endif
+
+	/*
+	 * trustsec headers
+	 */
+	struct sfe_trustsec_hdr ingress_trustsec_hdr;
+	struct sfe_trustsec_hdr egress_trustsec_hdr;
+
 	/*
 	 * Packet translation information.
 	 */
@@ -219,7 +255,10 @@ struct sfe_ipv4_connection_match {
 	u32 priority;
 	u32 dscp;
 	u32 mark;			/* mark for outgoing packet */
-
+	u8 svc_id;			/* service_class for the flow */
+#if defined(SFE_PPE_QOS_SUPPORTED)
+	u8 int_pri;			/* INT_PRI value of PPE QDISC */
+#endif
 
 	u8 ingress_vlan_hdr_cnt;        /* Ingress active vlan headers count */
 	u8 egress_vlan_hdr_cnt;         /* Egress active vlan headers count */
@@ -236,9 +275,17 @@ struct sfe_ipv4_connection_match {
 	u16 pppoe_session_id;
 	u8 pppoe_remote_mac[ETH_ALEN];
 
+	/*
+	 * Multicast destination device list
+	 */
+	struct list_head mc_list;
+
 	struct net_device *top_interface_dev;	/* Used by tun6rd to store decap VLAN netdevice.*/
 
+	void *fls_conn;
+
 	bool sawf_valid;		/* Indicates mark has valid SAWF information */
+	bool ingress_trustsec_valid;	/* Indicates trustsec header is valid */
 };
 
 /*
@@ -273,17 +320,7 @@ struct sfe_ipv4_connection {
 	u32 debug_read_seq;		/* sequence number for debug dump */
 	bool removed;			/* Indicates the connection is removed */
 	struct rcu_head rcu;		/* delay rcu free */
-#ifdef CONFIG_NETFILTER_CP_FLOWSTATS
-	int start_time;                 /* Jiffies to track when the flow started */
-#endif
 };
-
-#ifdef CONFIG_NETFILTER_CP_FLOWSTATS /* CP_LATENCY_IP*/
-#define MIN_IP_PKT_SIZE 84
-#define CP_IP_REC_TIMEOUT_SFE 15 /* In seconds: */
-#define MSEC_IN_SEC 1000
-#define MAX_RTT_THRESHOLD  (700)*(HZ)/(MSEC_IN_SEC)
-#endif
 
 /*
  * IPv4 connections and hash table size information.
@@ -331,6 +368,7 @@ enum sfe_ipv4_exception_events {
 	SFE_IPV4_EXCEPTION_EVENT_IP_OPTIONS_INCOMPLETE,
 	SFE_IPV4_EXCEPTION_EVENT_UNHANDLED_PROTOCOL,
 	SFE_IPV4_EXCEPTION_EVENT_NO_HEADROOM,
+	SFE_IPV4_EXCEPTION_EVENT_UNCLONE_FAILED,
 	SFE_IPV4_EXCEPTION_EVENT_INVALID_PPPOE_SESSION,
 	SFE_IPV4_EXCEPTION_EVENT_INCORRECT_PPPOE_PARSING,
 	SFE_IPV4_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME,
@@ -340,6 +378,7 @@ enum sfe_ipv4_exception_events {
 	SFE_IPV4_EXCEPTION_EVENT_TUN6RD_NO_CONNECTION,
 	SFE_IPV4_EXCEPTION_EVENT_TUN6RD_NEEDS_FRAGMENTATION,
 	SFE_IPV4_EXCEPTION_EVENT_TUN6RD_SYNC_ON_FIND,
+	SFE_IPV4_EXCEPTION_EVENT_TUN6RD_SMALL_TTL,
 	SFE_IPV4_EXCEPTION_EVENT_GRE_HEADER_INCOMPLETE,
 	SFE_IPV4_EXCEPTION_EVENT_GRE_NO_CONNECTION,
 	SFE_IPV4_EXCEPTION_EVENT_GRE_IP_OPTIONS_OR_INITIAL_FRAGMENT,
@@ -349,6 +388,13 @@ enum sfe_ipv4_exception_events {
 	SFE_IPV4_EXCEPTION_EVENT_ESP_IP_OPTIONS_OR_INITIAL_FRAGMENT,
 	SFE_IPV4_EXCEPTION_EVENT_ESP_NEEDS_FRAGMENTATION,
 	SFE_IPV4_EXCEPTION_EVENT_ESP_SMALL_TTL,
+	SFE_IPV4_EXCEPTION_EVENT_INGRESS_TRUSTSEC_SGT_MISMATCH,
+	SFE_IPV4_EXCEPTION_EVENT_GSO_NOT_SUPPORTED,
+	SFE_IPV4_EXCEPTION_EVENT_TSO_SEG_MAX_NOT_SUPPORTED,
+	SFE_IPV4_EXCEPTION_EVENT_L2TPV3_NO_CONNECTION,
+	SFE_IPV4_EXCEPTION_EVENT_L2TPV3_IP_OPTIONS_OR_INITIAL_FRAGMENT,
+	SFE_IPV4_EXCEPTION_EVENT_L2TPV3_SMALL_TTL,
+	SFE_IPV4_EXCEPTION_EVENT_L2TPV3_NEEDS_FRAGMENTATION,
 	SFE_IPV4_EXCEPTION_EVENT_LAST
 };
 
@@ -378,6 +424,7 @@ struct sfe_ipv4_stats {
 	u64 packets_dropped64;			/* Number of IPv4 packets dropped */
 	u64 packets_forwarded64;		/* Number of IPv4 packets forwarded */
 	u64 packets_fast_xmited64;		/* Number of IPv4 packets fast transmited */
+	u64 packets_fast_qdisc_xmited64;	/* Number of IPv4 packets that used fast qdisc xmit */
 	u64 packets_not_forwarded64;	/* Number of IPv4 packets not forwarded */
 	u64 exception_events64[SFE_IPV4_EXCEPTION_EVENT_LAST];
 	u64 pppoe_encap_packets_forwarded64;	/* Number of IPv4 PPPoE encap packets forwarded */
@@ -385,6 +432,7 @@ struct sfe_ipv4_stats {
 	u64 pppoe_bridge_packets_forwarded64;	/* Number of IPv4 PPPoE bridge packets forwarded */
 	u64 pppoe_bridge_packets_3tuple_forwarded64;    /* Number of IPv4 PPPoE bridge packets forwarded based on 3-tuple info */
 	u64 connection_create_requests_overflow64;	/* Number of IPV4 connection create requests after reaching max limit */
+	u64 bridge_vlan_passthorugh_forwarded64;	/* Number of IPV4 bridge vlan passthrough packets forwarded */
 };
 
 /*
@@ -405,7 +453,7 @@ struct sfe_ipv4_per_service_class_stats {
  *	stat entries for each service class.
  */
 struct sfe_ipv4_service_class_stats_db {
-	struct sfe_ipv4_per_service_class_stats psc_stats[SFE_MAX_SERVICE_CLASS_ID];
+	struct sfe_ipv4_per_service_class_stats psc_stats[SFE_MAX_SERVICE_CLASS_ID + 1];
 				/*  Per service class stats */
 };
 
@@ -480,9 +528,10 @@ struct sfe_ipv4_debug_xml_write_state {
 	int iter_exception;		/* Next exception iterator */
 };
 
-typedef bool (*sfe_ipv4_debug_xml_write_method_t)(struct sfe_ipv4 *si, char *buffer, char *msg, size_t *length,
+typedef int (*sfe_ipv4_debug_xml_write_method_t)(struct sfe_ipv4 *si, char *buffer, char *msg, size_t length,
 						  int *total_read, struct sfe_ipv4_debug_xml_write_state *ws);
 
+void sfe_ipv4_fls_clear(void);
 u16 sfe_ipv4_gen_ip_csum(struct iphdr *iph);
 bool sfe_ipv4_service_class_stats_get(uint8_t sid, uint64_t *bytes, uint64_t *packets);
 void sfe_ipv4_service_class_stats_inc(struct sfe_ipv4 *si, uint8_t sid, uint64_t bytes);
