@@ -27,14 +27,11 @@
 #include <net/pkt_sched.h>
 #include <net/vxlan.h>
 #include <net/gre.h>
-#if defined(SFE_RFS_SUPPORTED)
-#include <ppe_rfs.h>
-#endif
+
 #include "sfe_debug.h"
 #include "sfe_api.h"
 #include "sfe.h"
 #include "sfe_pppoe.h"
-#include "sfe_pppoe_mgr.h"
 #include "sfe_vlan.h"
 #include "sfe_ipv4.h"
 #include "sfe_ipv6.h"
@@ -46,7 +43,6 @@ extern int max_ipv6_conn;
 #define sfe_ipv6_addr_copy(src, dest) memcpy((void *)(dest), (void *)(src), 16)
 #define sfe_ipv4_stopped(CTX) (rcu_dereference((CTX)->ipv4_stats_sync_cb) == NULL)
 #define sfe_ipv6_stopped(CTX) (rcu_dereference((CTX)->ipv6_stats_sync_cb) == NULL)
-#define SFE_IPSEC_TUNNEL_TYPE 31
 
 typedef enum sfe_exception {
 	SFE_EXCEPTION_IPV4_MSG_UNKNOW,
@@ -126,7 +122,7 @@ struct sfe_ctx_instance_internal {
 	u32 exceptions[SFE_EXCEPTION_MAX];		/* Statistics for exception */
 
 	int32_t l2_feature_support;		/* L2 feature support */
-	int32_t ppe_rfs_feature_support;	/* PPE RFS feature support */
+
 };
 
 static struct sfe_ctx_instance_internal __sfe_ctx;
@@ -244,10 +240,6 @@ static bool sfe_routed_dev_allow(struct net_device *dev, bool is_routed,  bool c
 	}
 #endif
 
-	if (dev->type == SFE_IPSEC_TUNNEL_TYPE) {
-		return true;
-	}
-
 	return false;
 }
 
@@ -270,24 +262,10 @@ bool sfe_dev_has_hw_csum(struct net_device *dev)
 	}
 #endif
 	/*
-	 * Tunnel MAP-E/DS-LITE share the same Routing netlink operator
+	 * Tunnel MAP-E/DS-LITE and Tun6rd share the same Routing netlink operator
 	 * whose kind is "ip6tnl". The HW csum for these tunnel devices should be disabled.
 	*/
 	if (dev->rtnl_link_ops && !strcmp(dev->rtnl_link_ops->kind, "ip6tnl")) {
-		return false;
-	}
-
-	/*
-	 * IPSec tunnel
-	 */
-	if (dev->type == SFE_IPSEC_TUNNEL_TYPE) {
-		return false;
-	}
-
-	/*
-	 * Tun6rd tunnel
-	 */
-	if (dev->type == ARPHRD_SIT) {
 		return false;
 	}
 
@@ -612,79 +590,6 @@ static void sfe_ipv4_stats_one_sync_callback(struct sfe_connection_sync *sis)
 	sync_cb(sfe_ctx->ipv4_stats_sync_data, &msg);
 }
 
-#if defined(SFE_RFS_SUPPORTED)
-/*
- * sfe_is_ppe_rfs_feature_enabled()
- *	Check if ppe rfs features flag feature is enabled or not.
- *
- * 32bit read is atomic. No need of locks.
- */
-bool sfe_is_ppe_rfs_feature_enabled(void)
-{
-	struct sfe_ctx_instance_internal *sfe_ctx = &__sfe_ctx;
-	return (sfe_ctx->ppe_rfs_feature_support == 1);
-}
-
-/*
- * sfe_get_ppe_rfs_feature()
- *	PPE rfs feature is enabled/disabled
- */
-ssize_t sfe_get_ppe_rfs_feature(struct device *dev,
-				     struct device_attribute *attr,
-				     char *buf)
-{
-	struct sfe_ctx_instance_internal *sfe_ctx = &__sfe_ctx;
-	ssize_t len;
-
-	spin_lock_bh(&sfe_ctx->lock);
-	len = snprintf(buf, (ssize_t)(PAGE_SIZE), "PPE RFS feature is %s\n", sfe_ctx->ppe_rfs_feature_support ? "enabled" : "disabled");
-	spin_unlock_bh(&sfe_ctx->lock);
-	return len;
-}
-
-/*
- * sfe_set_ppe_rfs_feature()
- *	Enable or disable ppe rfs features flag.
- */
-ssize_t sfe_set_ppe_rfs_feature(struct device *dev, struct device_attribute *attr,
-                         const char *buf, size_t count)
-{
-        unsigned long val;
-	struct sfe_ctx_instance_internal *sfe_ctx = &__sfe_ctx;
-	int ret;
-        ret = sscanf(buf, "%lu", &val);
-
-	if (ret != 1) {
-		pr_err("Wrong input, %s\n", buf);
-		return -EINVAL;
-	}
-
-	if (val != 1 && val != 0) {
-		pr_err("Input should be either 1 or 0, (%s)\n", buf);
-		return -EINVAL;
-	}
-
-	spin_lock_bh(&sfe_ctx->lock);
-
-	if (sfe_ctx->ppe_rfs_feature_support && val) {
-		spin_unlock_bh(&sfe_ctx->lock);
-		pr_err("PPE RFS feature is already enabled\n");
-		return -EINVAL;
-	}
-
-	if (!sfe_ctx->ppe_rfs_feature_support && !val) {
-		spin_unlock_bh(&sfe_ctx->lock);
-		pr_err("PPE RFS feature is already disabled\n");
-		return -EINVAL;
-	}
-
-	sfe_ctx->ppe_rfs_feature_support = val;
-	spin_unlock_bh(&sfe_ctx->lock);
-
-	return count;
-}
-#endif
-
 /*
  * sfe_recv_parse_l2()
  *	Parse L2 headers
@@ -774,7 +679,6 @@ sfe_tx_status_t sfe_create_ipv4_rule_msg(struct sfe_ctx_instance_internal *sfe_c
 			sfe_incr_exceptions(SFE_EXCEPTION_TCP_INVALID);
 			goto failed_ret;
 		}
-		break;
 
 	case IPPROTO_UDP:
 		break;
@@ -783,15 +687,6 @@ sfe_tx_status_t sfe_create_ipv4_rule_msg(struct sfe_ctx_instance_internal *sfe_c
 		break;
 
 	case IPPROTO_IPV6:
-		break;
-
-	case IPPROTO_ESP:
-		break;
-
-	case IPPROTO_RAW:
-		/*
-		 * for accelerating PPPoE bridged flows using 3-tuple information
-		 */
 		break;
 
 	default:
@@ -856,39 +751,6 @@ sfe_tx_status_t sfe_create_ipv4_rule_msg(struct sfe_ctx_instance_internal *sfe_c
 	if (!sfe_ipv4_create_rule(&msg->msg.rule_create)) {
 		/* success */
 		ret = SFE_CMN_RESPONSE_ACK;
-#if defined(SFE_RFS_SUPPORTED)
-		if (sfe_is_ppe_rfs_feature_enabled()) {
-			struct ppe_rfs_ipv4_rule_create_msg pr4rc;
-			struct sfe_ipv4_rule_create_msg *rule_create = &msg->msg.rule_create;
-
-			pr4rc.valid_flags = rule_create->valid_flags;
-			pr4rc.rule_flags = rule_create->rule_flags;
-
-			pr4rc.tuple.flow_ip = ntohl(rule_create->tuple.flow_ip);
-			pr4rc.tuple.flow_ident = ntohs(rule_create->tuple.flow_ident);
-			pr4rc.tuple.return_ip = ntohl(rule_create->tuple.return_ip);
-			pr4rc.tuple.return_ident = ntohs(rule_create->tuple.return_ident);
-			pr4rc.tuple.protocol = rule_create->tuple.protocol;
-			pr4rc.conn_rule.flow_mtu = rule_create->conn_rule.flow_mtu;
-			pr4rc.conn_rule.return_mtu = rule_create->conn_rule.return_mtu;
-			pr4rc.conn_rule.flow_ip_xlate = ntohl(rule_create->conn_rule.flow_ip_xlate);
-			pr4rc.conn_rule.flow_ident_xlate = ntohs(rule_create->conn_rule.flow_ident_xlate);
-			pr4rc.conn_rule.return_ip_xlate = ntohl(rule_create->conn_rule.return_ip_xlate);
-			pr4rc.conn_rule.return_ident_xlate = ntohs(rule_create->conn_rule.return_ident_xlate);
-			pr4rc.conn_rule.flow_interface_num = rule_create->conn_rule.flow_interface_num;
-			pr4rc.conn_rule.return_interface_num = rule_create->conn_rule.return_interface_num;
-
-			if (rule_create->rule_flags & SFE_RULE_CREATE_FLAG_BRIDGE_FLOW) {
-				pr4rc.rule_flags |= PPE_RFS_V4_RULE_FLAG_BRIDGE_FLOW;
-			}
-
-			pr4rc.rule_flags |= PPE_RFS_V4_RULE_FLAG_RETURN_VALID | PPE_RFS_V4_RULE_FLAG_FLOW_VALID;
-
-			if (ppe_rfs_ipv4_rule_create(&pr4rc) != PPE_RFS_RET_SUCCESS) {
-				DEBUG_TRACE("%p: Error in pushing PPE RFS rules\n", msg);
-			}
-		}
-#endif
 	} else {
 		/* Failed */
 		ret = SFE_CMN_RESPONSE_EMSG;
@@ -934,28 +796,6 @@ sfe_tx_status_t sfe_destroy_ipv4_rule_msg(struct sfe_ctx_instance_internal *sfe_
 		sfe_incr_exceptions(SFE_EXCEPTION_ENQUEUE_FAILED);
 		return SFE_TX_FAILURE_QUEUE;
 	}
-
-#if defined(SFE_RFS_SUPPORTED)
-	if (sfe_is_ppe_rfs_feature_enabled()) {
-		struct ppe_rfs_ipv4_rule_destroy_msg pr4rd;
-		struct sfe_ipv4_rule_destroy_msg *rule_destroy = &msg->msg.rule_destroy;
-		sfe_ipv4_fill_connection_dev(rule_destroy, &pr4rd.original_dev, &pr4rd.reply_dev);
-
-		pr4rd.tuple.flow_ip = ntohl(rule_destroy->tuple.flow_ip);
-		pr4rd.tuple.flow_ident = ntohs(rule_destroy->tuple.flow_ident);
-		pr4rd.tuple.return_ip = ntohl(rule_destroy->tuple.return_ip);
-		pr4rd.tuple.return_ident = ntohs(rule_destroy->tuple.return_ident);
-		pr4rd.tuple.protocol = rule_destroy->tuple.protocol;
-
-		if (!pr4rd.original_dev || !pr4rd.reply_dev) {
-			DEBUG_INFO("%p: Null dev when destroying v4 PPE RFS rule\n", &pr4rd);
-		} else {
-			if (ppe_rfs_ipv4_rule_destroy(&pr4rd) != PPE_RFS_RET_SUCCESS) {
-				DEBUG_INFO("%p: Error in deleting PPE RFS rule\n", &pr4rd);
-			}
-		}
-	}
-#endif
 
 	sfe_ipv4_destroy_rule(&msg->msg.rule_destroy);
 
@@ -1288,15 +1128,6 @@ sfe_tx_status_t sfe_create_ipv6_rule_msg(struct sfe_ctx_instance_internal *sfe_c
 	case IPPROTO_GRE:
 		break;
 
-	case IPPROTO_ESP:
-		break;
-
-	case IPPROTO_RAW:
-		/*
-		 * for accelerating PPPoE bridged flows using 3-tuple information
-		 */
-		break;
-
 	default:
 		ret = SFE_CMN_RESPONSE_EMSG;
 		sfe_incr_exceptions(SFE_EXCEPTION_PROTOCOL_NOT_SUPPORT);
@@ -1344,42 +1175,8 @@ sfe_tx_status_t sfe_create_ipv6_rule_msg(struct sfe_ctx_instance_internal *sfe_c
 	}
 
 	if (!sfe_ipv6_create_rule(&msg->msg.rule_create)) {
-		/* SFE success */
+		/* success */
 		ret = SFE_CMN_RESPONSE_ACK;
-#if defined(SFE_RFS_SUPPORTED)
-		if (sfe_is_ppe_rfs_feature_enabled()) {
-			struct ppe_rfs_ipv6_rule_create_msg pr6rc;
-			struct sfe_ipv6_rule_create_msg *rule_create = &msg->msg.rule_create;
-
-			pr6rc.valid_flags = rule_create->valid_flags;
-			pr6rc.rule_flags = rule_create->rule_flags;
-			pr6rc.tuple.flow_ip[0] = ntohl(rule_create->tuple.flow_ip[3]);
-			pr6rc.tuple.flow_ip[1] = ntohl(rule_create->tuple.flow_ip[2]);
-			pr6rc.tuple.flow_ip[2] = ntohl(rule_create->tuple.flow_ip[1]);
-			pr6rc.tuple.flow_ip[3] = ntohl(rule_create->tuple.flow_ip[0]);
-			pr6rc.tuple.flow_ident = ntohs(rule_create->tuple.flow_ident);
-			pr6rc.tuple.return_ip[0] = ntohl(rule_create->tuple.return_ip[3]);
-			pr6rc.tuple.return_ip[1] = ntohl(rule_create->tuple.return_ip[2]);
-			pr6rc.tuple.return_ip[2] = ntohl(rule_create->tuple.return_ip[1]);
-			pr6rc.tuple.return_ip[3] = ntohl(rule_create->tuple.return_ip[0]);
-			pr6rc.tuple.return_ident = ntohs(rule_create->tuple.return_ident);
-			pr6rc.tuple.protocol = rule_create->tuple.protocol;
-			pr6rc.conn_rule.flow_mtu = rule_create->conn_rule.flow_mtu;
-			pr6rc.conn_rule.return_mtu = rule_create->conn_rule.return_mtu;
-			pr6rc.conn_rule.flow_interface_num = rule_create->conn_rule.flow_interface_num;
-			pr6rc.conn_rule.return_interface_num = rule_create->conn_rule.flow_interface_num;
-
-			if (rule_create->rule_flags & SFE_RULE_CREATE_FLAG_BRIDGE_FLOW) {
-				pr6rc.rule_flags |= PPE_RFS_V6_RULE_FLAG_BRIDGE_FLOW;
-			}
-
-			pr6rc.rule_flags |= PPE_RFS_V6_RULE_FLAG_RETURN_VALID | PPE_RFS_V6_RULE_FLAG_FLOW_VALID;
-
-			if (ppe_rfs_ipv6_rule_create(&pr6rc) != PPE_RFS_RET_SUCCESS) {
-				DEBUG_TRACE("%p: Error in pushing PPE RFS rules\n", msg);
-			}
-		}
-#endif
 	} else {
 		/* Failed */
 		ret = SFE_CMN_RESPONSE_EMSG;
@@ -1425,34 +1222,6 @@ sfe_tx_status_t sfe_destroy_ipv6_rule_msg(struct sfe_ctx_instance_internal *sfe_
 		sfe_incr_exceptions(SFE_EXCEPTION_ENQUEUE_FAILED);
 		return SFE_TX_FAILURE_QUEUE;
 	}
-
-#if defined(SFE_RFS_SUPPORTED)
-	if (sfe_is_ppe_rfs_feature_enabled()) {
-		struct ppe_rfs_ipv6_rule_destroy_msg pr6rd;
-		struct sfe_ipv6_rule_destroy_msg *rule_destroy = &msg->msg.rule_destroy;
-
-		pr6rd.tuple.flow_ip[0] = ntohl(rule_destroy->tuple.flow_ip[3]);
-		pr6rd.tuple.flow_ip[1] = ntohl(rule_destroy->tuple.flow_ip[2]);
-		pr6rd.tuple.flow_ip[2] = ntohl(rule_destroy->tuple.flow_ip[1]);
-		pr6rd.tuple.flow_ip[3] = ntohl(rule_destroy->tuple.flow_ip[0]);
-		pr6rd.tuple.flow_ident = ntohs(rule_destroy->tuple.flow_ident);
-		pr6rd.tuple.return_ip[0] = ntohl(rule_destroy->tuple.return_ip[3]);
-		pr6rd.tuple.return_ip[1] = ntohl(rule_destroy->tuple.return_ip[2]);
-		pr6rd.tuple.return_ip[2] = ntohl(rule_destroy->tuple.return_ip[1]);
-		pr6rd.tuple.return_ip[3] = ntohl(rule_destroy->tuple.return_ip[0]);
-		pr6rd.tuple.return_ident = ntohs(rule_destroy->tuple.return_ident);
-		pr6rd.tuple.protocol = rule_destroy->tuple.protocol;
-
-		sfe_ipv6_fill_connection_dev(rule_destroy, &pr6rd.original_dev, &pr6rd.reply_dev);
-		if (!pr6rd.original_dev || !pr6rd.reply_dev) {
-			DEBUG_INFO("%p: NULL dev while destroying PPE RFS rule\n", &pr6rd);
-		} else {
-			if (ppe_rfs_ipv6_rule_destroy(&pr6rd) != PPE_RFS_RET_SUCCESS) {
-				DEBUG_INFO("%p: Error while deleting PPE RFS IPv6 rule\n", &pr6rd);
-			}
-		}
-	}
-#endif
 
 	sfe_ipv6_destroy_rule(&msg->msg.rule_destroy);
 
@@ -1783,11 +1552,6 @@ bool sfe_service_class_stats_get(uint8_t sid, uint64_t *bytes, uint64_t *packets
 }
 EXPORT_SYMBOL(sfe_service_class_stats_get);
 
-#if defined(SFE_RFS_SUPPORTED)
-static const struct device_attribute sfe_ppe_rfs_feature_attr =
-	__ATTR(ppe_rfs_feature,  0644, sfe_get_ppe_rfs_feature, sfe_set_ppe_rfs_feature);
-#endif
-
 /*
  * sfe_is_l2_feature_enabled()
  *	Check if l2 features flag feature is enabled or not. (VLAN, PPPOE, BRIDGE and tunnels)
@@ -1864,76 +1628,6 @@ static const struct device_attribute sfe_l2_feature_attr =
 	__ATTR(l2_feature,  0644, sfe_get_l2_feature, sfe_set_l2_feature);
 
 /*
- * sfe_get_pppoe_br_accel_mode()
- *	Get PPPoE bridge acceleration mode
- */
-static ssize_t sfe_get_pppoe_br_accel_mode(struct device *dev,
-					struct device_attribute *attr,
-					char *buf)
-{
-	int len;
-	sfe_pppoe_br_accel_mode_t mode;
-	char *str;
-
-	mode = sfe_pppoe_get_br_accel_mode();
-	switch ((int)mode) {
-	case SFE_PPPOE_BR_ACCEL_MODE_DISABLED:
-		str = "ACCEL_MODE_DISABLED";
-		break;
-
-	case SFE_PPPOE_BR_ACCEL_MODE_EN_5T:
-		str = "ACCEL_MODE_5_TUPLE";
-		break;
-
-	case SFE_PPPOE_BR_ACCEL_MODE_EN_3T:
-		str = "ACCEL_MODE_3_TUPLE";
-		break;
-
-	default:
-		str = "Unknown ACCEL_MODE";
-		break;
-	}
-	len = snprintf(buf, PAGE_SIZE, "%s\n", str);
-
-	return len;
-}
-
-/*
- * sfe_set_pppoe_br_accel_mode()
- *	Set PPPoE bridge acceleration mode
- */
-static ssize_t sfe_set_pppoe_br_accel_mode(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf,
-				size_t count)
-{
-        uint32_t val;
-	int ret;
-
-        ret = sscanf(buf, "%u", &val);
-	if (ret != 1) {
-		DEBUG_ERROR("Unable to write the mode\n");
-		return -EINVAL;
-	}
-
-	ret = sfe_pppoe_set_br_accel_mode(val);
-	if (ret) {
-		DEBUG_ERROR("Wrong input: %d\n"
-			    "Input should be %u or %u or %u\n"
-			    "(%u==ACCEL_MODE_DISABLED %u==ACCEL_MODE_EN_5T %u==ACCEL_MODE_EN_3T)\n",
-			val,
-			SFE_PPPOE_BR_ACCEL_MODE_DISABLED, SFE_PPPOE_BR_ACCEL_MODE_EN_5T, SFE_PPPOE_BR_ACCEL_MODE_EN_3T,
-			SFE_PPPOE_BR_ACCEL_MODE_DISABLED, SFE_PPPOE_BR_ACCEL_MODE_EN_5T, SFE_PPPOE_BR_ACCEL_MODE_EN_3T);
-		return -EINVAL;
-	}
-
-	return count;
-}
-
-static const struct device_attribute sfe_pppoe_br_accel_mode_attr =
-	__ATTR(pppoe_br_accel_mode, 0644, sfe_get_pppoe_br_accel_mode, sfe_set_pppoe_br_accel_mode);
-
-/*
  * sfe_init_if()
  */
 int sfe_init_if(void)
@@ -1964,33 +1658,11 @@ int sfe_init_if(void)
 		goto exit2;
 	}
 
-	/*
-	 * Create sys/sfe/l2_feature
-	 */
 	result = sysfs_create_file(sfe_ctx->sys_sfe, &sfe_l2_feature_attr.attr);
 	if (result) {
 		DEBUG_ERROR("failed to register L2 feature flag sysfs file: %d\n", result);
 		goto exit2;
 	}
-
-	/*
-	 * Create sys/sfe/pppoe_br_accel_mode
-	 */
-	result = sysfs_create_file(sfe_ctx->sys_sfe, &sfe_pppoe_br_accel_mode_attr.attr);
-	if (result) {
-		DEBUG_ERROR("failed to create pppoe_br_accel_mode: %d\n", result);
-		goto exit2;
-	}
-
-#if defined(SFE_RFS_SUPPORTED)
-	result = sysfs_create_file(sfe_ctx->sys_sfe, &sfe_ppe_rfs_feature_attr.attr);
-	if (result) {
-		DEBUG_ERROR("failed to register PPE RFS feature flag sysfs file: %d\n", result);
-		goto exit2;
-	}
-#endif
-
-	sfe_pppoe_mgr_init();
 
 	spin_lock_init(&sfe_ctx->lock);
 
@@ -2021,8 +1693,6 @@ void sfe_exit_if(void)
 	 * Unregister our receive callback.
 	 */
 	RCU_INIT_POINTER(athrs_fast_nat_recv, NULL);
-
-	sfe_pppoe_mgr_exit();
 
 	/*
 	 * Wait for all callbacks to complete.
