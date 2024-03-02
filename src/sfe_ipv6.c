@@ -36,6 +36,10 @@
 #include <net/addrconf.h>
 #include <net/gre.h>
 
+#if defined(SFE_RFS_SUPPORTED)
+#include <ppe_rfs.h>
+#endif
+
 #include "sfe_debug.h"
 #include "sfe_api.h"
 #include "sfe.h"
@@ -45,8 +49,11 @@
 #include "sfe_ipv6_tcp.h"
 #include "sfe_ipv6_icmp.h"
 #include "sfe_pppoe.h"
+#include "sfe_pppoe_mgr.h"
+#include "sfe_ipv6_pppoe_br.h"
 #include "sfe_ipv6_tunipip6.h"
 #include "sfe_ipv6_gre.h"
+#include "sfe_ipv6_esp.h"
 
 #define sfe_ipv6_addr_copy(src, dest) memcpy((void *)(dest), (void *)(src), 16)
 
@@ -92,6 +99,7 @@ static char *sfe_ipv6_exception_events_string[SFE_IPV6_EXCEPTION_EVENT_LAST] = {
 	"INVALID_PPPOE_SESSION",
 	"INCORRECT_PPPOE_PARSING",
 	"PPPOE_NOT_SET_IN_CME",
+	"PPPOE_BR_NOT_IN_CME",
 	"INGRESS_VLAN_TAG_MISMATCH",
 	"INVALID_SOURCE_INTERFACE",
 	"TUNIPIP6_HEADER_INCOMPLETE",
@@ -104,7 +112,11 @@ static char *sfe_ipv6_exception_events_string[SFE_IPV6_EXCEPTION_EVENT_LAST] = {
 	"GRE_NO_CONNECTION",
 	"GRE_IP_OPTIONS_OR_INITIAL_FRAGMENT",
 	"GRE_SMALL_TTL",
-	"GRE_NEEDS_FRAGMENTATION"
+	"GRE_NEEDS_FRAGMENTATION",
+	"ESP_NO_CONNECTION",
+	"ESP_IP_OPTIONS_OR_INITIAL_FRAGMENT",
+	"ESP_NEEDS_FRAGMENTATION",
+	"ESP_SMALL_TTL"
 };
 
 static struct sfe_ipv6 __si6;
@@ -161,12 +173,11 @@ sfe_ipv6_find_connection_match_rcu(struct sfe_ipv6 *si, struct net_device *dev, 
 	 * Hopefully the first entry is the one we want.
 	 */
 	hlist_for_each_entry_rcu(cm, lhead, hnode) {
-		if ((cm->match_dest_port != dest_port) ||
-		    (cm->match_src_port != src_port) ||
-		    (!sfe_ipv6_addr_equal(cm->match_src_ip, src_ip)) ||
+		if ((!sfe_ipv6_addr_equal(cm->match_src_ip, src_ip)) ||
 		    (!sfe_ipv6_addr_equal(cm->match_dest_ip, dest_ip)) ||
-		    (cm->match_protocol != protocol) ||
-		    (cm->match_dev != dev)) {
+		    (cm->match_dest_port != dest_port) ||
+		    (cm->match_src_port != src_port) ||
+		    (cm->match_protocol != protocol)) {
 			continue;
 		}
 
@@ -331,6 +342,8 @@ static void sfe_ipv6_update_summary_stats(struct sfe_ipv6 *si, struct sfe_ipv6_s
 		stats->pppoe_encap_packets_forwarded64 += s->pppoe_encap_packets_forwarded64;
 		stats->pppoe_decap_packets_forwarded64 += s->pppoe_decap_packets_forwarded64;
 		stats->pppoe_bridge_packets_forwarded64 += s->pppoe_bridge_packets_forwarded64;
+		stats->pppoe_bridge_packets_3tuple_forwarded64 += s->pppoe_bridge_packets_3tuple_forwarded64;
+		stats->connection_create_requests_overflow64 += s->connection_create_requests_overflow64;
 	}
 }
 
@@ -437,7 +450,7 @@ static inline unsigned int sfe_ipv6_get_connection_hash(u8 protocol, struct sfe_
 	for (idx = 0; idx < 4; idx++) {
 		hash ^= src_ip->addr[idx] ^ dest_ip->addr[idx];
 	}
-	hash = hash ^ protocol ^ ntohs(src_port ^ dest_port);
+	hash = hash ^ protocol ^ ntohs(src_port) ^ dest_port;
 	return ((hash >> SFE_IPV6_CONNECTION_HASH_SHIFT) ^ hash) & SFE_IPV6_CONNECTION_HASH_MASK;
 }
 
@@ -744,6 +757,31 @@ void sfe_ipv6_flush_connection(struct sfe_ipv6 *si,
 	this_cpu_inc(si->stats_pcpu->connection_flushes64);
 	sfe_ipv6_sync_status(si, c, reason);
 
+#if defined(SFE_RFS_SUPPORTED)
+	if (sfe_is_ppe_rfs_feature_enabled()) {
+		struct ppe_rfs_ipv6_rule_destroy_msg pr6rd;
+
+		pr6rd.tuple.flow_ip[0] = ntohl(c->src_ip[0].addr[3]);
+		pr6rd.tuple.flow_ip[1] = ntohl(c->src_ip[0].addr[2]);
+		pr6rd.tuple.flow_ip[2] = ntohl(c->src_ip[0].addr[1]);
+		pr6rd.tuple.flow_ip[3] = ntohl(c->src_ip[0].addr[0]);
+		pr6rd.tuple.flow_ident = ntohs(c->src_port);
+		pr6rd.tuple.return_ip[0] = ntohl(c->dest_ip[0].addr[3]);
+		pr6rd.tuple.return_ip[1] = ntohl(c->dest_ip[0].addr[2]);
+		pr6rd.tuple.return_ip[2] = ntohl(c->dest_ip[0].addr[1]);
+		pr6rd.tuple.return_ip[3] = ntohl(c->dest_ip[0].addr[0]);
+		pr6rd.tuple.return_ident = ntohs(c->dest_port);
+		pr6rd.tuple.protocol = c->protocol;
+
+		pr6rd.original_dev = c->original_dev;
+		pr6rd.reply_dev = c->reply_dev;
+
+		if (ppe_rfs_ipv6_rule_destroy(&pr6rd) != PPE_RFS_RET_SUCCESS) {
+			DEBUG_INFO("%p: Error in deleting IPv6 PPE RFS rules\n", &pr6rd);
+		}
+	}
+#endif
+
 	/*
 	 * Release our hold of the source and dest devices and free the memory
 	 * for our connection objects.
@@ -914,12 +952,27 @@ int sfe_ipv6_recv(struct net_device *dev, struct sk_buff *skb, struct sfe_l2_inf
 		next_hdr = ext_hdr->next_hdr;
 	}
 
+	/*
+	 * Handle PPPoE bridge packets using 3-tuple acceleration if SFE_PPPOE_BR_ACCEL_MODE_EN_3T
+	 */
+	if (unlikely(sfe_l2_parse_flag_check(l2_info, SFE_L2_PARSE_FLAGS_PPPOE_INGRESS)) &&
+	    unlikely(sfe_pppoe_get_br_accel_mode() == SFE_PPPOE_BR_ACCEL_MODE_EN_3T)) {
+		struct ethhdr *eth = eth_hdr(skb);
+		if (!sfe_pppoe_mgr_find_session(l2_info->pppoe_session_id, eth->h_source)) {
+			return sfe_ipv6_recv_pppoe_bridge(si, skb, dev, len, iph, ihl, l2_info);
+		}
+	}
+
 	if (IPPROTO_UDP == next_hdr) {
 		return sfe_ipv6_recv_udp(si, skb, dev, len, iph, ihl, sync_on_find, l2_info, tun_outer);
 	}
 
 	if (IPPROTO_TCP == next_hdr) {
 		return sfe_ipv6_recv_tcp(si, skb, dev, len, iph, ihl, sync_on_find, l2_info);
+	}
+
+	if (IPPROTO_ESP == next_hdr) {
+		return sfe_ipv6_recv_esp(si, skb, dev, len, iph, ihl, sync_on_find, l2_info, tun_outer);
 	}
 
 	if (IPPROTO_ICMPV6 == next_hdr) {
@@ -1224,6 +1277,20 @@ int sfe_ipv6_create_rule(struct sfe_ipv6_rule_create_msg *msg)
 
 	spin_lock_bh(&si->lock);
 
+#if (defined(SFE_MEM_PROFILE_MEDIUM) || defined(SFE_MEM_PROFILE_LOW))
+        if (si->num_connections  >= sfe_ipv6_max_conn_count()) {
+		spin_unlock_bh(&si->lock);
+		this_cpu_inc(si->stats_pcpu->connection_create_requests_overflow64);
+		kfree(reply_cm);
+		kfree(original_cm);
+		kfree(c);
+		dev_put(src_dev);
+		dev_put(dest_dev);
+		DEBUG_WARN("%px: Maximum connection count(%d), reached %d\n", msg, sfe_ipv6_max_conn_count(), si->num_connections);
+		return -EPERM;
+        }
+#endif
+
 	/*
 	 * Check to see if there is already a flow that matches the rule we're
 	 * trying to create.  If there is then we can't create a new one.
@@ -1269,7 +1336,7 @@ int sfe_ipv6_create_rule(struct sfe_ipv6_rule_create_msg *msg)
 	original_cm->match_dev = src_dev;
 	original_cm->match_protocol = tuple->protocol;
 	original_cm->match_src_ip[0] = *(struct sfe_ipv6_addr *)tuple->flow_ip;
-	original_cm->match_src_port = netif_is_vxlan(src_dev) ? 0 : tuple->flow_ident;
+	original_cm->match_src_port = (msg->rule_flags & SFE_RULE_CREATE_NO_SRC_IDENT) ? 0 : tuple->flow_ident;
 	original_cm->match_dest_ip[0] = *(struct sfe_ipv6_addr *)tuple->return_ip;
 	original_cm->match_dest_port = tuple->return_ident;
 
@@ -1366,9 +1433,7 @@ int sfe_ipv6_create_rule(struct sfe_ipv6_rule_create_msg *msg)
 			/*
 			 * Dont enable CSUM offload
 			 */
-#if 0
 			 original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD;
-#endif
 		}
 	}
 
@@ -1390,14 +1455,14 @@ int sfe_ipv6_create_rule(struct sfe_ipv6_rule_create_msg *msg)
 		ether_addr_copy(original_cm->pppoe_remote_mac, msg->pppoe_rule.flow_pppoe_remote_mac);
 
 		reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP;
-		reply_cm->l2_hdr_size += SFE_PPPOE_SESSION_HEADER_SIZE;
+		reply_cm->l2_hdr_size += PPPOE_SES_HLEN;
 		reply_cm->pppoe_session_id = msg->pppoe_rule.flow_pppoe_session_id;
 		ether_addr_copy(reply_cm->pppoe_remote_mac, msg->pppoe_rule.flow_pppoe_remote_mac);
 	}
 
 	if (msg->valid_flags & SFE_RULE_CREATE_PPPOE_ENCAP_VALID) {
 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_PPPOE_ENCAP;
-		original_cm->l2_hdr_size += SFE_PPPOE_SESSION_HEADER_SIZE;
+		original_cm->l2_hdr_size += PPPOE_SES_HLEN;
 		original_cm->pppoe_session_id = msg->pppoe_rule.return_pppoe_session_id;
 		ether_addr_copy(original_cm->pppoe_remote_mac, msg->pppoe_rule.return_pppoe_remote_mac);
 
@@ -1464,13 +1529,9 @@ int sfe_ipv6_create_rule(struct sfe_ipv6_rule_create_msg *msg)
 	reply_cm->xlate_dest_port = tuple->flow_ident;
 
 	/*
-	 * Keep source port as 0 for VxLAN tunnels.
+	 * Keep source port as 0 for tunnels requiring 4-tuple match (eg: VxLAN).
 	 */
-	if (netif_is_vxlan(src_dev) || netif_is_vxlan(dest_dev)) {
-		reply_cm->match_src_port = 0;
-	} else {
-		reply_cm->match_src_port = tuple->return_ident;
-	}
+	reply_cm->match_src_port = (msg->rule_flags & SFE_RULE_CREATE_NO_SRC_IDENT) ? 0 : tuple->return_ident;
 
 	reply_cm->xmit_dev = src_dev;
 	reply_cm->xmit_dev_mtu = msg->conn_rule.flow_mtu;
@@ -1618,9 +1679,9 @@ int sfe_ipv6_create_rule(struct sfe_ipv6_rule_create_msg *msg)
 	reply_cm->top_interface_dev = NULL;
 
 #ifdef SFE_GRE_TUN_ENABLE
-	if (!(reply_cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PASSTHROUGH)) {
+	if ((IPPROTO_GRE == tuple->protocol) && !(reply_cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PASSTHROUGH)) {
 		rcu_read_lock();
-		reply_cm->proto = rcu_dereference(inet6_protos[tuple->protocol]);
+		reply_cm->proto = rcu_dereference(inet6_protos[IPPROTO_GRE]);
 		rcu_read_unlock();
 
 		if (unlikely(!reply_cm->proto)) {
@@ -1636,6 +1697,24 @@ int sfe_ipv6_create_rule(struct sfe_ipv6_rule_create_msg *msg)
 		}
 	}
 #endif
+
+	if ((IPPROTO_ESP == tuple->protocol) && !(reply_cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PASSTHROUGH)) {
+		rcu_read_lock();
+		reply_cm->proto = rcu_dereference(inet6_protos[IPPROTO_ESP]);
+		rcu_read_unlock();
+
+		if (unlikely(!reply_cm->proto)) {
+			this_cpu_inc(si->stats_pcpu->connection_create_failures64);
+			spin_unlock_bh(&si->lock);
+			kfree(reply_cm);
+			kfree(original_cm);
+			kfree(c);
+			dev_put(src_dev);
+			dev_put(dest_dev);
+			DEBUG_WARN("sfe: ESP proto handler is not registered\n");
+			return -EPERM;
+		}
+	}
 
 	/*
 	 * Decapsulation path have proto set.
@@ -1673,9 +1752,7 @@ int sfe_ipv6_create_rule(struct sfe_ipv6_rule_create_msg *msg)
 			/*
 			 * Dont enable CSUM offload
 			 */
-#if 0
 			 reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_CSUM_OFFLOAD;
-#endif
 		}
 	}
 
@@ -1746,6 +1823,16 @@ int sfe_ipv6_create_rule(struct sfe_ipv6_rule_create_msg *msg)
 			reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_NO_SEQ_CHECK;
 		}
 		break;
+
+	case IPPROTO_RAW:
+		/*
+		 * Set src_port to 0 to avoid hash collision in connection match lookups.
+		 */
+		original_cm->match_src_port = 0;
+		original_cm->xlate_src_port = 0;
+		reply_cm->match_src_port = 0;
+		reply_cm->xlate_src_port = 0;
+		break;
 	}
 
 	/*
@@ -1779,10 +1866,10 @@ int sfe_ipv6_create_rule(struct sfe_ipv6_rule_create_msg *msg)
 	/*
 	 * We have everything we need!
 	 */
-	DEBUG_INFO("new connection - p: %d\n"
+	DEBUG_INFO("%px: new connection - p: %d\n"
 		   "  s: %s:%pxM(%pxM):%pI6(%pI6):%u(%u)\n"
 		   "  d: %s:%pxM(%pxM):%pI6(%pI6):%u(%u)\n",
-		   tuple->protocol,
+		   c, tuple->protocol,
 		   src_dev->name, msg->conn_rule.flow_mac, NULL,
 		   (void *)tuple->flow_ip, (void *)tuple->flow_ip, ntohs(tuple->flow_ident), ntohs(tuple->flow_ident),
 		   dest_dev->name, NULL, msg->conn_rule.return_mac,
@@ -1790,6 +1877,32 @@ int sfe_ipv6_create_rule(struct sfe_ipv6_rule_create_msg *msg)
 
 	return 0;
 }
+
+#if defined(SFE_RFS_SUPPORTED)
+/*
+ * sfe_ipv6_fill_connection_dev()
+ */
+void sfe_ipv6_fill_connection_dev(struct sfe_ipv6_rule_destroy_msg *msg, struct net_device **original_dev, struct net_device **reply_dev)
+{
+	struct sfe_ipv6 *si = &__si6;
+	struct sfe_ipv6_connection *c;
+	struct sfe_ipv6_5tuple *tuple = &msg->tuple;
+
+	spin_lock_bh(&si->lock);
+	c = sfe_ipv6_find_connection(si, tuple->protocol, (struct sfe_ipv6_addr *)tuple->flow_ip, tuple->flow_ident,
+				     (struct sfe_ipv6_addr *)tuple->return_ip, tuple->return_ident);
+	if (!c) {
+		*original_dev = NULL;
+		*reply_dev = NULL;
+		spin_unlock_bh(&si->lock);
+		return;
+	}
+
+	*original_dev = c->original_dev;
+	*reply_dev = c->reply_dev;
+	spin_unlock_bh(&si->lock);
+}
+#endif
 
 /*
  * sfe_ipv6_destroy_rule()
@@ -2370,8 +2483,9 @@ static bool sfe_ipv6_debug_dev_read_stats(struct sfe_ipv6 *si, char *buffer, cha
 			      "hash_hits=\"%llu\" hash_reorders=\"%llu\" "
 			      "pppoe_encap_pkts_fwded=\"%llu\" "
 			      "pppoe_decap_pkts_fwded=\"%llu\" "
-			      "pppoe_bridge_pkts_fwded=\"%llu\" />\n",
-
+			      "pppoe_bridge_pkts_fwded=\"%llu\" "
+			      "pppoe_bridge_pkts_3tuple_fwded=\"%llu\" "
+			      "connection_create_requests_overflow64=\"%llu\" />\n",
 				num_conn,
 				stats.packets_dropped64,
 				stats.packets_fast_xmited64,
@@ -2387,7 +2501,9 @@ static bool sfe_ipv6_debug_dev_read_stats(struct sfe_ipv6 *si, char *buffer, cha
 				stats.connection_match_hash_reorders64,
 				stats.pppoe_encap_packets_forwarded64,
 				stats.pppoe_decap_packets_forwarded64,
-				stats.pppoe_bridge_packets_forwarded64);
+				stats.pppoe_bridge_packets_forwarded64,
+				stats.pppoe_bridge_packets_3tuple_forwarded64,
+				stats.connection_create_requests_overflow64);
 	if (copy_to_user(buffer + *total_read, msg, CHAR_DEV_MSG_SIZE)) {
 		return false;
 	}

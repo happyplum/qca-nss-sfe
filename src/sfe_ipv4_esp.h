@@ -1,8 +1,8 @@
 /*
- * sfe_pppoe.h
- *	Shortcut flow acceleration for PPPoE flow
+ * sfe_ipv4_esp.h
+ *	Shortcut forwarding engine - IPv4 ESP header file
  *
- * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,19 +17,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#ifndef __SFE_PPPOE_H
-#define __SFE_PPPOE_H
-
-#include <linux/ppp_defs.h>
-#include <linux/if_pppox.h>
-
-struct sfe_ppp_hdr {
-	u16 protocol;
-};
-
-void sfe_pppoe_add_header(struct sk_buff *skb, u16 pppoe_session_id, u16 ppp_protocol);
-bool sfe_pppoe_parse_hdr(struct sk_buff *skb, struct sfe_l2_info *l2_info);
-void sfe_pppoe_undo_parse(struct sk_buff *skb, struct sfe_l2_info *l2_info);
-int sfe_pppoe_set_br_accel_mode(sfe_pppoe_br_accel_mode_t mode);
-
-#endif /* __SFE_PPPOE_H */
+int sfe_ipv4_recv_esp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_device *dev,
+		unsigned int len, struct iphdr *iph, unsigned int ihl, bool sync_on_find,
+		struct sfe_l2_info *l2_info, bool tun_outer);

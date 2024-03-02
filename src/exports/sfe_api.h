@@ -93,6 +93,7 @@
 #define SFE_RULE_CREATE_DIRECTION_VALID    (1<<8)	/**< Acceleration direction is valid. */
 #define SFE_RULE_CREATE_SRC_MAC_VALID      (1<<9)	/**< Source MAC address is valid. */
 #define SFE_RULE_CREATE_MARK_VALID         (1<<10)	/**< SKB marking fields are valid. */
+#define SFE_RULE_CREATE_NO_SRC_IDENT       (1<<11)	/**< Zero out the src ident. */
 
 /*
  * Source MAC address validity flags; used with the mac_valid_flags field in the sfe_ipv4_src_mac_rule structure.
@@ -241,6 +242,17 @@ struct sfe_protocol_tcp_rule {
 	u8 return_window_scale;	/**< Return direction's window scaling factor. */
 	u16 reserved;		/**< Reserved; padding for alignment. */
 };
+
+/**
+ * sfe_pppoe_br_accel_mode_t
+ *	PPPoE bridge acceleration modes.
+ */
+typedef enum {
+	SFE_PPPOE_BR_ACCEL_MODE_DISABLED,       /**< No acceleration */
+	SFE_PPPOE_BR_ACCEL_MODE_EN_5T,          /**< 5-tuple (src_ip, dest_ip, src_port, dest_port, protocol) acceleration */
+	SFE_PPPOE_BR_ACCEL_MODE_EN_3T,          /**< 3-tuple (src_ip, dest_ip, pppoe session id) acceleration */
+	SFE_PPPOE_BR_ACCEL_MODE_MAX             /**< Indicates the last item */
+} __attribute__ ((__packed__)) sfe_pppoe_br_accel_mode_t;
 
 /**
  * PPPoE connection rules structure.
@@ -805,6 +817,14 @@ void sfe_ipv4_mark_rule_update(struct sfe_connection_mark *mark);
  * None.
  */
 void sfe_ipv6_mark_rule_update(struct sfe_connection_mark *mark);
+
+/**
+ * Gets the acceleration mode of PPPoE bridge.
+ *
+ * @return
+ * The acceleration mode.
+ */
+sfe_pppoe_br_accel_mode_t sfe_pppoe_get_br_accel_mode(void);
 
 /**
  * @}

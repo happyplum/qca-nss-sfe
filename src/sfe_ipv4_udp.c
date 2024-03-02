@@ -47,6 +47,8 @@ static int sfe_ipv4_udp_sk_deliver(struct sk_buff *skb, struct sfe_ipv4_connecti
 	struct sock *sk;
 	int ret;
 	int (*encap_rcv)(struct sock *sk, struct sk_buff *skb);
+	struct udphdr *uh;
+	unsigned short ulen;
 
 	/*
 	 * Call the decap handler for valid encap_rcv handler.
@@ -63,26 +65,43 @@ static int sfe_ipv4_udp_sk_deliver(struct sk_buff *skb, struct sfe_ipv4_connecti
 #else
 	nf_reset_ct(skb);
 #endif
-
 	skb_pull(skb, ihl);
 	skb_reset_transport_header(skb);
+	sk = (struct sock *)up;
+
+	uh = udp_hdr(skb);
+	ulen = ntohs(uh->len);
+	if (ulen < sizeof(*uh) || pskb_trim_rcsum(skb, ulen)) {
+		DEBUG_TRACE("%px: short packet", skb);
+		goto except;
+	}
+	uh = udp_hdr(skb);
 
 	/*
 	 * Verify checksum before giving to encap_rcv handler function.
 	 * TODO: The following approach is ignorant for UDPLITE for now.
 	 * Instead, consider calling Linux API to do checksum validation.
 	 */
-	if (unlikely(skb->ip_summed != CHECKSUM_UNNECESSARY) && unlikely(skb->ip_summed != CHECKSUM_COMPLETE)) {
-		skb->csum = inet_compute_pseudo(skb, IPPROTO_UDP);
-		if (unlikely(__skb_checksum_complete(skb))) {
-			DEBUG_ERROR("%px: sfe: Invalid udp checksum\n", skb);
-			kfree_skb(skb);
-			return -1;
+	if (unlikely(skb->ip_summed != CHECKSUM_UNNECESSARY && skb->ip_summed != CHECKSUM_COMPLETE) && uh->check) {
+
+		UDP_SKB_CB(skb)->partial_cov = 0;
+		UDP_SKB_CB(skb)->cscov = skb->len;
+
+		if (skb_checksum_init(skb, IPPROTO_UDP, inet_compute_pseudo)) {
+			DEBUG_TRACE("%px: checksum initilization failed", skb);
+			goto except;
+		}
+
+		if (inet_get_convert_csum(sk)) {
+			skb_checksum_try_convert(skb, IPPROTO_UDP, inet_compute_pseudo);
+		}
+
+		if (udp_lib_checksum_complete(skb)) {
+			DEBUG_TRACE("%px: udp checksum validation failed", skb);
+			goto except;
 		}
 		DEBUG_TRACE("%px: sfe: udp checksum verified in s/w correctly.\n", skb);
 	}
-
-	sk = (struct sock *)up;
 
 	/*
 	 * At this point, L4 checksum has already been verified and pkt is going
@@ -100,16 +119,19 @@ static int sfe_ipv4_udp_sk_deliver(struct sk_buff *skb, struct sfe_ipv4_connecti
 	 */
 	ret = encap_rcv(sk, skb);
 	if (unlikely(ret)) {
-		/*
-		 * If encap_rcv fails, vxlan driver drops the packet.
-		 * No need to free the skb here.
-		 */
-
-		DEBUG_ERROR("%px: sfe: udp-decap API return error: %d\n", skb, ret);
-		return -1;
+		DEBUG_TRACE("%px: sfe: udp-decap API return error: %d\n", skb, ret);
+		goto except;
 	}
 
 	return 0;
+
+except:
+	/*
+	 * The packet could be restored with the original L2 Information for L2
+	 * flow, but it couldn't restore the NATed IP in the packets.
+	 */
+	skb_push(skb, ihl);
+	return 1;
 }
 
 /*
@@ -176,7 +198,7 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	if (unlikely(!cm)) {
 
 		/*
-		 * try a 4-tuple lookup; required for tunnels like vxlan.
+		 * Try a 4-tuple lookup; required for tunnels like vxlan.
 		 */
 		cm = sfe_ipv4_find_connection_match_rcu(si, dev, IPPROTO_UDP, src_ip, 0, dest_ip, dest_port);
 		if (unlikely(!cm)) {
@@ -209,7 +231,7 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	}
 
 	/*
-	 * If our packet has beern marked as "flush on find" we can't actually
+	 * If our packet has been marked as "sync on find" we can't actually
 	 * forward it in the fast path, but now that we've found an associated
 	 * connection we need sync its status before exception it to slow path.
 	 */
@@ -217,7 +239,7 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		sfe_ipv4_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
 		rcu_read_unlock();
 		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_UDP_IP_OPTIONS_OR_INITIAL_FRAGMENT);
-		DEBUG_TRACE("%px: sfe: sync on find\n", cm);
+		DEBUG_TRACE("%px: sync on find\n", cm);
 		return 0;
 	}
 
@@ -264,7 +286,7 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	 * If our packet is larger than the MTU of the transmit interface then
 	 * we can't forward it easily.
 	 */
-	if (unlikely(len > cm->xmit_dev_mtu)) {
+	if (unlikely((len > cm->xmit_dev_mtu) && (!cm->up))) {
 		sfe_ipv4_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
 		rcu_read_unlock();
 		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_UDP_NEEDS_FRAGMENTATION);
@@ -291,6 +313,16 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		 */
 		iph = (struct iphdr *)skb->data;
 		udph = (struct udphdr *)(skb->data + ihl);
+	}
+
+	/*
+	 * Check if skb has enough headroom to write L2 headers
+	 */
+	if (unlikely(skb_headroom(skb) < cm->l2_hdr_size)) {
+		rcu_read_unlock();
+		DEBUG_WARN("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
+		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_NO_HEADROOM);
+		return 0;
 	}
 
 	/*
@@ -329,30 +361,19 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		 * If packet contains PPPoE header but CME doesn't contain PPPoE flag yet we are exceptioning
 		 * the packet to linux
 		 */
-		if (unlikely(!(cm->flags & SFE_IPV4_CONNECTION_MATCH_FLAG_BRIDGE_FLOW))) {
+		if (unlikely(!bridge_flow)) {
 			rcu_read_unlock();
 			DEBUG_TRACE("%px: CME doesn't contain PPPoE flag but packet has PPPoE header\n", skb);
 			sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_PPPOE_NOT_SET_IN_CME);
 			return 0;
-
 		}
 
 		/*
 		 * For bridged flows when packet contains PPPoE header, restore the header back and forward
 		 * to xmit interface
 		 */
-		__skb_push(skb, (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr)));
+		__skb_push(skb, PPPOE_SES_HLEN);
 		this_cpu_inc(si->stats_pcpu->pppoe_bridge_packets_forwarded64);
-	}
-
-	/*
-	 * Check if skb has enough headroom to write L2 headers
-	 */
-	if (unlikely(skb_headroom(skb) < cm->l2_hdr_size)) {
-		rcu_read_unlock();
-		DEBUG_WARN("%px: Not enough headroom: %u\n", skb, skb_headroom(skb));
-		sfe_ipv4_exception_stats_inc(si, SFE_IPV4_EXCEPTION_EVENT_NO_HEADROOM);
-		return 0;
 	}
 
 	/*
@@ -448,11 +469,7 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		 * Also validates UDP checksum before calling decap handler.
 		 */
 		err = sfe_ipv4_udp_sk_deliver(skb, cm, ihl);
-		if (unlikely(err == -1)) {
-			rcu_read_unlock();
-			this_cpu_inc(si->stats_pcpu->packets_dropped64);
-			return 1;
-		} else if (unlikely(err == 1)) {
+		if (unlikely(err == 1)) {
 			rcu_read_unlock();
 			this_cpu_inc(si->stats_pcpu->packets_not_forwarded64);
 			return 0;
@@ -571,12 +588,6 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 	this_cpu_inc(si->stats_pcpu->packets_forwarded64);
 
 	/*
-	 * We're going to check for GSO flags when we transmit the packet so
-	 * start fetching the necessary cache line now.
-	 */
-	prefetch(skb_shinfo(skb));
-
-	/*
 	 * We do per packet condition check before we could fast xmit the
 	 * packet.
 	 */
@@ -584,6 +595,12 @@ int sfe_ipv4_recv_udp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_devic
 		this_cpu_inc(si->stats_pcpu->packets_fast_xmited64);
 		return 1;
 	}
+
+	/*
+	 * We're going to check for GSO flags when we transmit the packet so
+	 * start fetching the necessary cache line now.
+	 */
+	prefetch(skb_shinfo(skb));
 
 	/*
 	 * Mark that this packet has been fast forwarded.
