@@ -1,9 +1,8 @@
 /*
- * sfe_ipv4_tcp.h
- *	Shortcut forwarding engine - IPv4 TCP header file
+ * sfe_ipv4_pppoe_br.h
+ *	Shortcut forwarding engine - IPv4 PPPoE bridge header file
  *
- * Copyright (c) 2013-2016, 2019-2020, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,10 +16,5 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-
-int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_device *dev,
-			     unsigned int len, struct iphdr *iph, unsigned int ihl, bool sync_on_find, struct sfe_l2_info *l2_info);
-
-uint8_t sfe_tso_clear_fixed_id_cfg_get(void);
-
-int sfe_tso_clear_fixed_id_cfg_set(uint8_t val);
+int sfe_ipv4_recv_pppoe_bridge(struct sfe_ipv4 *si, struct sk_buff *skb, struct net_device *dev,
+			      unsigned int len, struct iphdr *iph, unsigned int ihl, struct sfe_l2_info *l2_info);

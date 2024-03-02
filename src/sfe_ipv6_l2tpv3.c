@@ -1,6 +1,6 @@
 /*
- * sfe_ipv6_gre.c
- *	Shortcut forwarding engine file for IPv6 GRE
+ * sfe_ipv6_l2tpv3.c
+ *	Shortcut forwarding engine file for IPv6 L2TPv3
  *
  * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
@@ -18,7 +18,6 @@
  */
 
 #include <linux/skbuff.h>
-#include <net/gre.h>
 #include <net/protocol.h>
 #include <linux/etherdevice.h>
 #include <linux/version.h>
@@ -34,10 +33,10 @@
 #include "sfe_trustsec.h"
 
 /*
- * sfe_ipv6_recv_gre()
- *	Handle GRE packet receives and forwarding.
+ * sfe_ipv6_recv_l2tpv3()
+ *	Handles l2tpv3 packet receive and forwarding.
  */
-int sfe_ipv6_recv_gre(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_device *dev,
+int sfe_ipv6_recv_l2tpv3(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_device *dev,
 		      unsigned int len, struct ipv6hdr *iph, unsigned int ihl, bool sync_on_find,
 		      struct sfe_l2_info *l2_info, bool tun_outer)
 {
@@ -48,16 +47,6 @@ int sfe_ipv6_recv_gre(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	bool bridge_flow;
 	bool passthrough;
 	bool ret;
-
-	/*
-	 * Is our packet too short to contain a valid UDP header?
-	 */
-	if (!pskb_may_pull(skb, (sizeof(struct gre_base_hdr) + ihl))) {
-
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_GRE_HEADER_INCOMPLETE);
-		DEBUG_TRACE("packet too short for GRE header\n");
-		return 0;
-	}
 
 	/*
 	 * Read the IP address and port information.  Read the IP header data first
@@ -75,14 +64,14 @@ int sfe_ipv6_recv_gre(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 #ifdef CONFIG_NF_FLOW_COOKIE
 	cm = si->sfe_flow_cookie_table[skb->flow_cookie & SFE_FLOW_COOKIE_MASK].match;
 	if (unlikely(!cm)) {
-		cm = sfe_ipv6_find_connection_match_rcu(si, dev, IPPROTO_GRE, src_ip, 0, dest_ip, 0);
+		cm = sfe_ipv6_find_connection_match_rcu(si, dev, IPPROTO_L2TP, src_ip, 0, dest_ip, 0);
 	}
 #else
-	cm = sfe_ipv6_find_connection_match_rcu(si, dev, IPPROTO_GRE, src_ip, 0, dest_ip, 0);
+	cm = sfe_ipv6_find_connection_match_rcu(si, dev, IPPROTO_L2TP, src_ip, 0, dest_ip, 0);
 #endif
 	if (unlikely(!cm)) {
 		rcu_read_unlock();
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_GRE_NO_CONNECTION);
+		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_L2TPV3_NO_CONNECTION);
 		DEBUG_TRACE("no connection match found dev %s src ip %pI6 dest ip %pI6\n", dev->name, src_ip, dest_ip);
 		return 0;
 	}
@@ -132,7 +121,7 @@ int sfe_ipv6_recv_gre(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 	passthrough = cm->flags & SFE_IPV6_CONNECTION_MATCH_FLAG_PASSTHROUGH;
 
 	/*
-	 * If our packet has beern marked as "sync on find" we can't actually
+	 * If our packet has been marked as "sync on find" we can't actually
 	 * forward it in the fast path, but now that we've found an associated
 	 * connection we need sync its status before exception it to slow path. unless
 	 * it is passthrough packet.
@@ -142,7 +131,7 @@ int sfe_ipv6_recv_gre(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 		sfe_ipv6_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
 		rcu_read_unlock();
 
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_GRE_IP_OPTIONS_OR_INITIAL_FRAGMENT);
+		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_L2TPV3_IP_OPTIONS_OR_INITIAL_FRAGMENT);
 		DEBUG_TRACE("Sync on find\n");
 		return 0;
 	}
@@ -156,7 +145,7 @@ int sfe_ipv6_recv_gre(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 		sfe_ipv6_sync_status(si, cm->connection, SFE_SYNC_REASON_STATS);
 		rcu_read_unlock();
 
-		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_GRE_SMALL_TTL);
+		sfe_ipv6_exception_stats_inc(si, SFE_IPV6_EXCEPTION_EVENT_L2TPV3_SMALL_TTL);
 		DEBUG_TRACE("hop_limit too low\n");
 		return 0;
 	}
@@ -199,7 +188,7 @@ int sfe_ipv6_recv_gre(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 		eth = eth_hdr(skb);
 
 		pppoe_match = (cm->pppoe_session_id == sfe_l2_pppoe_session_id_get(l2_info)) &&
-				ether_addr_equal((u8*)cm->pppoe_remote_mac, (u8 *)eth->h_source);
+				ether_addr_equal((u8 *)cm->pppoe_remote_mac, (u8 *)eth->h_source);
 
 		if (unlikely(!pppoe_match)) {
 			DEBUG_TRACE("%px: PPPoE sessions ID %d and %d or MAC %pM and %pM did not match\n",
@@ -257,7 +246,7 @@ int sfe_ipv6_recv_gre(struct sfe_ipv6 *si, struct sk_buff *skb, struct net_devic
 
 		this_cpu_inc(si->stats_pcpu->packets_forwarded64);
 		rcu_read_unlock();
-		DEBUG_TRACE("%p: %s decap done\n",skb, __func__);
+		DEBUG_TRACE("%p: %s decap done\n", skb, __func__);
 		return 1;
 	}
 

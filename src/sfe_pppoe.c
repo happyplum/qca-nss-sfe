@@ -2,7 +2,7 @@
  * sfe_pppoe.c
  *     API for shortcut forwarding engine PPPoE flows
  *
- * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -26,6 +26,38 @@
 #include "sfe_api.h"
 #include "sfe.h"
 #include "sfe_pppoe.h"
+
+/*
+ * sfe_pppoe_br_accel_mode controls how to accelerate PPPoE bridge flow.
+ * - SFE_PPPOE_BR_ACCEL_MODE_EN_5T: 5-tuple (src_ip, dest_ip, src_port, dest_port, protocol) acceleration
+ * - SFE_PPPOE_BR_ACCEL_MODE_EN_3T: 3-tuple (src_ip, dest_ip, PPPoE session id) acceleration
+ * - SFE_PPPOE_BR_ACCEL_MODE_DISABLED: No acceleration
+ */
+static sfe_pppoe_br_accel_mode_t sfe_pppoe_br_accel_mode __read_mostly = SFE_PPPOE_BR_ACCEL_MODE_EN_5T;
+
+/*
+ * sfe_pppoe_get_br_accel_mode()
+ *	Gets PPPoE bridge acceleration mode
+ */
+sfe_pppoe_br_accel_mode_t sfe_pppoe_get_br_accel_mode(void)
+{
+	return sfe_pppoe_br_accel_mode;
+}
+EXPORT_SYMBOL(sfe_pppoe_get_br_accel_mode);
+
+/*
+ * sfe_pppoe_set_br_accel_mode()
+ *	Sets PPPoE bridge acceleration mode
+ */
+int sfe_pppoe_set_br_accel_mode(sfe_pppoe_br_accel_mode_t mode)
+{
+	if (mode >= SFE_PPPOE_BR_ACCEL_MODE_MAX) {
+		return -1;
+	}
+
+	sfe_pppoe_br_accel_mode = mode;
+	return 0;
+}
 
 /*
  * sfe_pppoe_add_header()
@@ -135,6 +167,7 @@ bool sfe_pppoe_parse_hdr(struct sk_buff *skb, struct sfe_l2_info *l2_info)
 void sfe_pppoe_undo_parse(struct sk_buff *skb, struct sfe_l2_info *l2_info)
 {
 	if (sfe_l2_parse_flag_check(l2_info, SFE_L2_PARSE_FLAGS_PPPOE_INGRESS)) {
+		skb->protocol = htons(ETH_P_PPP_SES);
 		__skb_push(skb, (sizeof(struct pppoe_hdr) + sizeof(struct sfe_ppp_hdr)));
 	}
 }
